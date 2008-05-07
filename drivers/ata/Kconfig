@@ -121,6 +121,36 @@ config SATA_MV
 
 	  If unsure, say N.
 
+config SATA_MV_TARGET
+	bool "Marvell SATA target mode support"
+	depends on SATA_MV
+	help
+	  This option enables support for target mode in the Marvell
+	  SATA driver.
+
+	  If unsure, say N.
+
+config SATA_MV_TARGET_PORT
+	int "Port to use for target/initiator mode"
+	depends on SATA_MV_TARGET
+	range 0 3
+	default 0
+
+config SATA_MV_TARGET_MODE
+	bool "Run device in target mode"
+	depends on SATA_MV_TARGET
+	help
+	  Set this option if you wish to run this device in target mode.
+	  If not selected, initiator mode will be enabled.
+
+	  If unsure, say N.
+
+config SATA_MV_TARGET_MB
+	int "Size of the target mode disks (in MB)"
+	depends on SATA_MV_TARGET_MODE
+	range 1 4096
+	default 64
+
 config SATA_NV
 	tristate "NVIDIA SATA support"
 	depends on PCI

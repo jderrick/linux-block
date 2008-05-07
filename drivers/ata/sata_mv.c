@@ -71,6 +71,8 @@
 #include <scsi/scsi_device.h>
 #include <linux/libata.h>
 
+#include "sata_target.h"
+
 #define DRV_NAME	"sata_mv"
 #define DRV_VERSION	"1.20"
 
@@ -242,6 +244,8 @@ enum {
 	MV5_PHY_CTL_OFS		= 0x0C,
 	SATA_INTERFACE_CFG_OFS	= 0x050,
 
+	IF_STATUS_FSM_STAT_MASK	= 0x3f000000,
+
 	MV_M2_PREAMP_MASK	= 0x7e0,
 
 	/* Port registers */
@@ -349,6 +353,11 @@ enum {
 
 	EDMA_HALTCOND_OFS	= 0x60,		/* GenIIe halt conditions */
 
+	BMDMA_CMD_OFS		= 0x224,
+	BMDMA_STATUS_OFS	= 0x228,
+	BMDMA_PRD_LO_OFS	= 0x22c,
+	BMDMA_PRD_HI_OFS	= 0x230,
+
 	GEN_II_NCQ_MAX_SECTORS	= 256,		/* max sects/io on Gen2 w/NCQ */
 
 	/* Host private flags (hp_flags) */
@@ -369,6 +378,15 @@ enum {
 	MV_PP_FLAG_NCQ_EN	= (1 << 1),	/* is EDMA set up for NCQ? */
 	MV_PP_FLAG_FBS_EN	= (1 << 2),	/* is EDMA set up for FBS? */
 	MV_PP_FLAG_DELAYED_EH	= (1 << 3),	/* delayed dev err handling */
+	MV_PP_FLAG_BMDMA_EN	= (1 << 4),	/* is BMDMA engine running? */
+	MV_PP_FLAG_MODE_TARGET	= (1 << 5),	/* port is target mode */
+	MV_PP_FLAG_MODE_INIT	= (1 << 6),	/* port is in initiator mode */
+	MV_PP_FLAG_TARGET	= MV_PP_FLAG_MODE_TARGET | MV_PP_FLAG_MODE_INIT,
+
+	/* C2C stuff */
+	C2C_REG_HOST_DEVICE_FIS	= 0x34,
+	C2C_DMA_ACTIVATE_FIS	= 0x39,
+	C2C_MSG_SIZE		= 10,
 };
 
 #define IS_GEN_I(hpriv) ((hpriv)->hp_flags & MV_HP_GEN_I)
@@ -445,6 +463,8 @@ struct mv_port_priv {
 	struct mv_sg		*sg_tbl[MV_MAX_Q_DEPTH];
 	dma_addr_t		sg_tbl_dma[MV_MAX_Q_DEPTH];
 
+	struct sata_target	*target;
+
 	unsigned int		req_idx;
 	unsigned int		resp_idx;
 
@@ -477,6 +497,33 @@ struct mv_host_priv {
 	struct dma_pool		*crpb_pool;
 	struct dma_pool		*sg_tbl_pool;
 };
+
+enum {
+	MV_TARGET_MODE_DISABLED = 0,
+	MV_TARGET_MODE_TARGET,
+	MV_TARGET_MODE_INITIATOR,
+};
+
+enum c2c_msg_type {
+	C2C_MSG_READ,
+	C2C_MSG_WRITE,
+	C2C_MSG_IDENTIFY,
+	C2C_MSG_SETF,
+};
+
+#if defined(CONFIG_SATA_MV_TARGET_MODE)
+static int target_mode = MV_TARGET_MODE_TARGET;
+static unsigned int target_mode_size = CONFIG_SATA_MV_TARGET_MB;
+static unsigned int target_mode_port = CONFIG_SATA_MV_TARGET_PORT;
+#elif defined(CONFIG_SATA_MV_TARGET)
+static int target_mode = MV_TARGET_MODE_INITIATOR;
+static unsigned int target_mode_size;
+static unsigned int target_mode_port = CONFIG_SATA_MV_TARGET_PORT;
+#else
+static int target_mode = MV_TARGET_MODE_DISABLED;
+static unsigned int target_mode_size;
+static unsigned int target_mode_port = -1;
+#endif
 
 struct mv_hw_ops {
 	void (*phy_errata)(struct mv_host_priv *hpriv, void __iomem *mmio,
@@ -1059,7 +1106,10 @@ static int mv_scr_read(struct ata_port *ap, unsigned int sc_reg_in, u32 *val)
 	unsigned int ofs = mv_scr_offset(sc_reg_in);
 
 	if (ofs != 0xffffffffU) {
-		*val = readl(mv_ap_base(ap) + ofs);
+		if (ap->port_no == target_mode_port && sc_reg_in == SCR_STATUS)
+			*val = 0x123;
+		else
+			*val = readl(mv_ap_base(ap) + ofs);
 		return 0;
 	} else
 		return -EINVAL;
@@ -1246,6 +1296,69 @@ static void mv_edma_cfg(struct ata_port *ap, int want_ncq)
 	writelfl(cfg, port_mmio + EDMA_CFG_OFS);
 }
 
+static void mv_disable_target_mode(struct ata_port *ap)
+{
+	struct mv_host_priv *hpriv = ap->host->private_data;
+	struct mv_port_priv *pp = ap->private_data;
+	void __iomem *port_mmio = mv_ap_base(ap);
+	u32 reg;
+
+	reg = readl(port_mmio + SATA_INTERFACE_CFG_OFS);
+	reg &= ~(1 << 11);
+	reg |= 1 << 12;
+	writelfl(reg, port_mmio + SATA_INTERFACE_CFG_OFS);
+	mv_reset_channel(hpriv, port_mmio, ap->port_no);
+
+	if (pp->pp_flags & MV_PP_FLAG_MODE_TARGET) {
+		sata_target_destroy(pp->target);
+		pp->target = NULL;
+	}
+
+	pp->pp_flags &= ~MV_PP_FLAG_TARGET;
+}
+
+static int mv_enable_target_mode(struct ata_port *ap, int mode)
+{
+	struct mv_host_priv *hpriv = ap->host->private_data;
+	struct mv_port_priv *pp = ap->private_data;
+	void __iomem *port_mmio = mv_ap_base(ap);
+	u32 reg;
+
+	if (IS_GEN_I(hpriv)) {
+		printk("sata_mv: target mode not supported on gen1\n");
+		return 1;
+	}
+
+	if (mode == MV_TARGET_MODE_TARGET && target_mode_port == ap->port_no) {
+		unsigned long sectors;
+
+		sectors = (target_mode_size * 1024) >> 1;
+		pp->target = sata_target_init(ap->dev, sectors, ST_QDEPTH,
+						MV_MAX_SG_CT);
+		if (!pp->target) {
+			printk("sata_mv: target mode init failed\n");
+			return 1;
+		}
+	}
+
+	/*
+	 * bit11 sets C2C comm mode, bit 12 is fix for 88SX60xx FEr SATA#8
+	 */
+	reg = readl(port_mmio + SATA_INTERFACE_CFG_OFS);
+	reg |= (1 << 11) | (1 << 12);
+	if (mode == MV_TARGET_MODE_INITIATOR) {
+		reg |= 1 << 10;
+		pp->pp_flags |= MV_PP_FLAG_MODE_INIT;
+	} else {
+		reg &= ~(1 << 10);
+		pp->pp_flags |= MV_PP_FLAG_MODE_TARGET;
+	}
+
+	writel(0, port_mmio + EDMA_ERR_IRQ_CAUSE_OFS);
+	writelfl(reg, port_mmio + SATA_INTERFACE_CFG_OFS);
+	return 0;
+}
+
 static void mv_port_free_dma_mem(struct ata_port *ap)
 {
 	struct mv_host_priv *hpriv = ap->host->private_data;
@@ -1322,6 +1435,12 @@ static int mv_port_start(struct ata_port *ap)
 			pp->sg_tbl_dma[tag] = pp->sg_tbl_dma[0];
 		}
 	}
+
+	if (target_mode != MV_TARGET_MODE_DISABLED) {
+		if (mv_enable_target_mode(ap, target_mode))
+			goto out_port_free_dma_mem;
+	}
+
 	return 0;
 
 out_port_free_dma_mem:
@@ -1340,28 +1459,24 @@ out_port_free_dma_mem:
  */
 static void mv_port_stop(struct ata_port *ap)
 {
+	struct mv_port_priv *pp = ap->private_data;
+
+	if (pp->pp_flags & MV_PP_FLAG_TARGET)
+		mv_disable_target_mode(ap);
+
 	mv_stop_edma(ap);
 	mv_port_free_dma_mem(ap);
 }
 
-/**
- *      mv_fill_sg - Fill out the Marvell ePRD (scatter gather) entries
- *      @qc: queued command whose SG list to source from
- *
- *      Populate the SG list and mark the last entry.
- *
- *      LOCKING:
- *      Inherited from caller.
- */
-static void mv_fill_sg(struct ata_queued_cmd *qc)
+static void __mv_fill_sg(struct mv_port_priv *pp, struct scatterlist *sgl,
+			 unsigned int sg_elem, unsigned int tag)
 {
-	struct mv_port_priv *pp = qc->ap->private_data;
-	struct scatterlist *sg;
 	struct mv_sg *mv_sg, *last_sg = NULL;
+	struct scatterlist *sg;
 	unsigned int si;
 
-	mv_sg = pp->sg_tbl[qc->tag];
-	for_each_sg(qc->sg, sg, qc->n_elem, si) {
+	mv_sg = pp->sg_tbl[tag];
+	for_each_sg(sgl, sg, sg_elem, si) {
 		dma_addr_t addr = sg_dma_address(sg);
 		u32 sg_len = sg_dma_len(sg);
 
@@ -1388,11 +1503,537 @@ static void mv_fill_sg(struct ata_queued_cmd *qc)
 		last_sg->flags_size |= cpu_to_le32(EPRD_FLAG_END_OF_TBL);
 }
 
+/**
+ *      mv_fill_sg - Fill out the Marvell ePRD (scatter gather) entries
+ *      @qc: queued command whose SG list to source from
+ *
+ *      Populate the SG list and mark the last entry.
+ *
+ *      LOCKING:
+ *      Inherited from caller.
+ */
+static void mv_fill_sg(struct ata_queued_cmd *qc)
+{
+	struct mv_port_priv *pp = qc->ap->private_data;
+
+	__mv_fill_sg(pp, qc->sg, qc->n_elem, qc->tag);
+}
+
 static void mv_crqb_pack_cmd(__le16 *cmdw, u8 data, u8 addr, unsigned last)
 {
 	u16 tmp = data | (addr << CRQB_CMD_ADDR_SHIFT) | CRQB_CMD_CS |
 		(last ? CRQB_CMD_LAST : 0);
 	*cmdw = cpu_to_le16(tmp);
+}
+
+static void mv_clear_bmdone_intr(struct ata_port *ap)
+{
+	int hard_port = mv_hardport_from_port(ap->port_no);
+	struct mv_port_priv *pp = ap->private_data;
+	void __iomem *hc_mmio;
+	u32 reg;
+
+	hc_mmio = mv_hc_base_from_port(mv_host_base(ap->host), hard_port);
+	reg = readl(hc_mmio + HC_IRQ_CAUSE_OFS);
+	reg &= ~(1 << hard_port);
+	writel(reg, hc_mmio + HC_IRQ_CAUSE_OFS);
+
+	pp->pp_flags &= ~MV_PP_FLAG_BMDMA_EN;
+}
+
+static void mv_c2c_reset_bmdma(struct ata_port *ap)
+{
+	void __iomem *port_mmio = mv_ap_base(ap);
+	u32 reg;
+
+	reg = readl(port_mmio + BMDMA_CMD_OFS);
+	reg &= ~0x1;
+	writel(reg, port_mmio + BMDMA_CMD_OFS);
+	writel(0, port_mmio + SATA_IFCTL_OFS);
+
+	mv_clear_bmdone_intr(ap);
+}
+
+static int mv_send_vu_fis(struct ata_port *ap, u32 *buffer, unsigned int words)
+{
+	void __iomem *port_mmio = mv_ap_base(ap);
+	int i, ret = 0;
+	u32 reg;
+
+	reg = readl(port_mmio + SATA_IFSTAT_OFS);
+	if (reg & IF_STATUS_FSM_STAT_MASK) {
+		printk(KERN_ERR "sata_mv: mv_send_vu_fis() on non-idle\n");
+		return 1;
+	}
+
+	/* set VU mode */
+	writel(1 << 8, port_mmio + SATA_IFCTL_OFS);
+
+	for (i = 1; i < words; i++)
+		writel(buffer[i - 1], port_mmio + VENDOR_UNIQUE_FIS_OFS);
+
+	writel((1 << 8) | (1 << 9), port_mmio + SATA_IFCTL_OFS);
+	writel(buffer[words - 1], port_mmio + VENDOR_UNIQUE_FIS_OFS);
+
+	for (i = 0; i < 200; i++) {
+		reg = readl(port_mmio + SATA_IFSTAT_OFS);
+		/* bit12 is done, bit13 is error */
+		if (reg & (1 << 12))
+			break;
+		if (reg & (1 << 13)) {
+			printk(KERN_ERR "sata_mv: mv_send_vu_fis() failed\n");
+			ret = 1;
+			break;
+		}
+		udelay(1);
+	}
+
+	/* clear VU mode */
+	writel(0, port_mmio + SATA_IFCTL_OFS);
+
+	if (ret)
+		printk(KERN_ERR "mv_send_vu_fis: stat %x\n", reg);
+
+	return ret;
+}
+
+static void mv_activate_bmdma(struct ata_port *ap, unsigned int tag,
+			      int dma_dir)
+{
+	struct mv_port_priv *pp = ap->private_data;
+	void __iomem *port_mmio = mv_ap_base(ap);
+	u32 addr_lo, addr_hi;
+
+	WARN_ON(pp->pp_flags & MV_PP_FLAG_BMDMA_EN);
+
+	pp->pp_flags |= MV_PP_FLAG_BMDMA_EN;
+
+	writel(0, port_mmio + BMDMA_CMD_OFS);
+
+	addr_lo = cpu_to_le32(pp->sg_tbl_dma[tag] & 0xffffffff);
+	addr_hi = cpu_to_le32((pp->sg_tbl_dma[tag] >> 16) >> 16);
+	writel(addr_lo, port_mmio + BMDMA_PRD_LO_OFS);
+	writel(addr_hi, port_mmio + BMDMA_PRD_HI_OFS);
+
+	if (dma_dir == DMA_FROM_DEVICE)
+		writeb((1 << 3) | (1 << 0), port_mmio + BMDMA_CMD_OFS);
+	else
+		writeb((1 << 0), port_mmio + BMDMA_CMD_OFS);
+}
+
+static int mv_c2c_activate_dma(struct ata_port *ap, unsigned int tag,
+			       int dma_dir)
+{
+	struct mv_port_priv *pp = ap->private_data;
+	void __iomem *port_mmio = mv_ap_base(ap);
+	int ret = 0;
+
+	if (pp->pp_flags & MV_PP_FLAG_MODE_TARGET) {
+		enum dma_data_direction target_dma_dir;
+
+		if (dma_dir == DMA_TO_DEVICE)
+			target_dma_dir = DMA_FROM_DEVICE;
+		else
+			target_dma_dir = DMA_TO_DEVICE;
+
+		mv_activate_bmdma(ap, tag, target_dma_dir);
+
+		if (target_dma_dir == DMA_FROM_DEVICE) {
+			u32 buffer[1];
+
+			buffer[0] = C2C_DMA_ACTIVATE_FIS;
+			ret = mv_send_vu_fis(ap, buffer, 1);
+		} else {
+			u32 reg;
+
+			reg = readl(port_mmio + SATA_IFCTL_OFS);
+			reg |= (1 << 16);
+			writel(reg, port_mmio + SATA_IFCTL_OFS);
+		}
+	} else
+		mv_activate_bmdma(ap, tag, dma_dir);
+
+	return ret;
+}
+
+/*
+ * Send 'register device to host' FIS. r_intr indicates whether the interrupt
+ * is being generated on the receiving side.
+ */
+static int mv_c2c_send_rdth_fis(struct ata_port *ap, u8 *msg, int r_intr)
+{
+	u32 buffer[5];
+
+	buffer[0] = C2C_REG_HOST_DEVICE_FIS;
+	if (r_intr)
+		buffer[0] |= 1 << 14;
+	buffer[0] |= msg[0] << 24;
+	buffer[1] = msg[1] | (msg[2] << 8) | (msg[3] << 16) | (msg[4] << 24);
+	buffer[2] = msg[5] | (msg[6] << 8) | (msg[7] << 16);
+	buffer[3] = msg[8] | (msg[9] << 8);
+	buffer[4] = 0;
+	return mv_send_vu_fis(ap, buffer, 5);
+}
+
+enum c2cc_event {
+	C2CC_BM_DONE		= 1,
+	C2CC_RDTH_FIS_DONE,
+	C2CC_BM_ERR,
+	C2CC_RDTH_FIS_ERR,
+};
+
+static void mv_c2c_complete(struct ata_port *ap, int tag, int err)
+{
+	struct ata_queued_cmd *qc = &ap->qcmd[tag];
+
+	if (qc) {
+		if (err)
+			qc->err_mask |= AC_ERR_DEV;
+		ata_qc_complete(qc);
+	} else
+		printk("mv_c2c_complete: missing command\n");
+}
+
+static void mv_c2c_initiator_rdth_fis_reply(struct ata_port *ap, u8 *msg,
+					    u32 msg_size)
+{
+	switch (msg[0]) {
+	case C2C_MSG_SETF:
+		mv_c2c_complete(ap, 0, msg[3] != 0);
+		break;
+	default:
+		printk("init_rdth_fis_reply: unknown op %d\n", msg[0]);
+		break;
+	}
+}
+
+static void mv_c2c_target_rdth_fis_reply(struct ata_port *ap, u8 *msg,
+					 u32 msg_size)
+{
+	struct mv_port_priv *pp = ap->private_data;
+	struct sata_target *st = pp->target;
+	int dma_dir = DMA_FROM_DEVICE;
+	u8 tag;
+
+	switch (msg[0]) {
+	case C2C_MSG_WRITE:
+		dma_dir = DMA_TO_DEVICE;
+	case C2C_MSG_READ: {
+		u16 dma_len = (msg[1] << 8) | msg[0];
+		int sg_elem;
+		u64 sector;
+
+		sector = ((u64) msg[3] << 40) | ((u64) msg[4] << 32) |
+			 ((u64) msg[5] << 24) | ((u64) msg[6] << 16) |
+			 ((u64) msg[7] << 8) | ((u64) msg[8]);
+		tag = msg[9];
+		sg_elem = sata_target_map_sg(st, sector, dma_len >> 9, tag,
+						dma_dir);
+		if (!sg_elem) {
+			printk("sata_mv: fis reply mapped no rw elements\n");
+			break;
+		} else if (sg_elem < 0) {
+			printk("sata_mv: dma map error\n");
+			break;
+		}
+		__mv_fill_sg(pp, target_tag_to_sgl(st, tag), sg_elem, tag);
+		mv_c2c_activate_dma(ap, tag, dma_dir);
+		break;
+		}
+	case C2C_MSG_IDENTIFY: {
+		u16 dma_len = (msg[1] << 8) | msg[0];
+		int ret;
+
+		BUG_ON(dma_len != 512);
+
+		ret = sata_target_map_identify(st, &tag);
+		if (!ret || ret < 0) {
+			printk(KERN_ERR "sata_mv: target ID map failed\n");
+			break;
+		}
+		__mv_fill_sg(pp, target_tag_to_sgl(st, tag), 1, tag);
+		mv_c2c_activate_dma(ap, tag, DMA_FROM_DEVICE);
+		break;
+		}
+	case C2C_MSG_SETF: {
+		u8 sub = msg[3];
+
+		/*
+		 * drop anything other than write cache toggling
+		 */
+		if (sub == 0x02) {
+			sata_target_wcache_set(st, 1);
+			msg[3] = 0;
+		} else if (sub == 0x82) {
+			sata_target_wcache_set(st, 0);
+			msg[3] = 0;
+		} else
+			msg[3] = 1;
+
+		mv_c2c_send_rdth_fis(ap, msg, 1);
+		break;
+		}
+	default:
+		printk("target_rdth_fis_reply: unknown op %d\n", msg[0]);
+		break;
+	}
+}
+
+static void dump_msg(u8 *msg, int len, char *info)
+{
+	int i;
+
+	printk("%s (%d): ", info, len);
+
+	if (msg) {
+		for (i = 0; i < len; i++)
+			printk("%x ", msg[i]);
+	}
+
+	printk("\n");
+}
+
+static void mv_c2c_initiator_callback(struct ata_port *ap, enum c2cc_event ev,
+				      u8 *msg, u32 msg_size)
+{
+	int tag, stat = 0;
+
+	dump_msg(msg, msg_size, "c2c initiator callback");
+
+	switch (ev) {
+	case C2CC_RDTH_FIS_DONE:
+		printk("mv_c2c_initiator_callback: fis done\n");
+		mv_c2c_initiator_rdth_fis_reply(ap, msg, msg_size);
+		break;
+	case C2CC_BM_ERR:
+		stat = 1;
+	case C2CC_BM_DONE:
+		printk("mv_c2c_initiator_callback: bm done %d\n", stat);
+		tag = msg[9];
+		mv_c2c_complete(ap, tag, stat);
+		break;
+	case C2CC_RDTH_FIS_ERR:
+		printk("mv_c2c_initiator_callback: fis err\n");
+		break;
+	default:
+		printk("mv_c2c_initiator_callback: unknown ev %d\n", ev);
+		break;
+	}
+}
+
+static void mv_c2c_target_callback(struct ata_port *ap, enum c2cc_event ev,
+				   u8 *msg, u32 msg_size)
+{
+	struct mv_port_priv *pp = ap->private_data;
+	struct sata_target *st = pp->target;
+	int tag, stat = 0;
+
+	dump_msg(msg, msg_size, "c2c target callback");
+
+	switch (ev) {
+	case C2CC_RDTH_FIS_DONE:
+		printk("mv_c2c_target_callback: fis done\n");
+		mv_c2c_target_rdth_fis_reply(ap, msg, msg_size);
+		break;
+	case C2CC_BM_ERR:
+		stat = 1;
+	case C2CC_BM_DONE:
+		tag = msg[9];
+		sata_target_unmap_sg(st, tag);
+		printk("mv_c2c_target_callback: bm done %d\n", stat);
+		break;
+	case C2CC_RDTH_FIS_ERR:
+		printk("mv_c2c_target_callback: fis err\n");
+		break;
+	default:
+		printk("mv_c2c_target_callback: unknown ev %d\n", ev);
+		break;
+	}
+}
+
+static void mv_c2c_callback(struct ata_port *ap, u32 event, u8 *msg,
+			    u32 msg_size)
+{
+	struct mv_port_priv *pp = ap->private_data;
+
+	if (pp->pp_flags & MV_PP_FLAG_MODE_TARGET)
+		mv_c2c_target_callback(ap, event, msg, msg_size);
+	else if (pp->pp_flags & MV_PP_FLAG_MODE_INIT)
+		mv_c2c_initiator_callback(ap, event, msg, msg_size);
+	else
+		BUG();
+}
+
+static void mv_c2c_fill_rw(u8 *msg, struct ata_queued_cmd *qc, int ext)
+{
+	sector_t sector = 0;
+
+	if (ext) {
+		sector |= ((u64) qc->tf.hob_lbah) << 40;
+		sector |= ((u64) qc->tf.hob_lbam) << 32;
+		sector |= ((u64) qc->tf.hob_lbal) << 24;
+	}
+
+	sector |= ((u64) qc->tf.lbah) << 16;
+	sector |= ((u64) qc->tf.lbam) << 8;
+	sector |= qc->tf.lbal;
+
+	msg[3] = ((u64) sector >> 40) & 0xff;
+	msg[4] = ((u64) sector >> 32) & 0xff;
+	msg[5] = (sector >> 24) & 0xff;
+	msg[6] = (sector >> 16) & 0xff;
+	msg[7] = (sector >>  8) & 0xff;
+	msg[8] = sector & 0xff;
+	msg[9] = qc->tag;
+}
+
+/*
+ * The initiator sends a command to the other end. Generally the message is
+ * of the form:
+ *
+ * Byte 0	Op code
+ *      1-2	Transfer size
+ *	3-8	Op code related payload (sector offset, etc)
+ *	9	Command tag
+ */
+static int mv_c2c_issue(struct ata_port *ap, struct ata_queued_cmd *qc)
+{
+	u8 msg[C2C_MSG_SIZE];
+	int ext = 0;
+
+	memset(msg, 0, sizeof(*msg));
+	msg[1] = (qc->nbytes >> 8) & 0xff;
+	msg[2] = qc->nbytes & 0xff;
+
+	switch (qc->tf.command) {
+	case ATA_CMD_FPDMA_READ:
+	case ATA_CMD_PIO_READ_EXT:
+	case ATA_CMD_READ_MULTI_EXT:
+	case ATA_CMD_READ_EXT:
+		ext = 1;
+	case ATA_CMD_PIO_READ:
+	case ATA_CMD_READ_MULTI:
+	case ATA_CMD_READ:
+		mv_c2c_fill_rw(msg, qc, ext);
+		msg[0] = C2C_MSG_READ;
+		break;
+	case ATA_CMD_WRITE_FUA_EXT:
+	case ATA_CMD_FPDMA_WRITE:
+	case ATA_CMD_PIO_WRITE_EXT:
+	case ATA_CMD_WRITE_MULTI_EXT:
+	case ATA_CMD_WRITE_MULTI_FUA_EXT:
+	case ATA_CMD_WRITE_EXT:
+		ext = 1;
+	case ATA_CMD_PIO_WRITE:
+	case ATA_CMD_WRITE_MULTI:
+	case ATA_CMD_WRITE:
+		mv_c2c_fill_rw(msg, qc, ext);
+		msg[0] = C2C_MSG_WRITE;
+		break;
+	case ATA_CMD_ID_ATA:
+		msg[0] = C2C_MSG_IDENTIFY;
+		break;
+	case ATA_CMD_SET_FEATURES:
+		msg[0] = C2C_MSG_SETF;
+		msg[3] = qc->tf.feature;
+		msg[4] = qc->tf.nsect;
+		msg[5] = qc->tf.lbal;
+		msg[6] = qc->tf.lbam;
+		msg[7] = qc->tf.lbah;
+		break;
+	default:
+		printk("mv_c2c_issue: not handling cmd=%x\n", qc->tf.command);
+		return -1;
+	}
+
+	if (qc->nbytes) {
+		mv_fill_sg(qc);
+		if (mv_c2c_activate_dma(ap, qc->tag, qc->dma_dir))
+			return -1;
+	}
+	if (mv_c2c_send_rdth_fis(ap, msg, 1))
+		return -1;
+
+	return 0;
+}
+
+static void mv_read_regs(struct ata_port *ap, struct ata_taskfile *tf)
+{
+#if 0
+	writeb(0, ap->ioaddr.ctl_addr);
+	tf->feature = readb(ap->ioaddr.feature_addr);
+	tf->nsect = readb(ap->ioaddr.nsect_addr);
+	tf->lbal = readb(ap->ioaddr.lbal_addr);
+	tf->lbam = readb(ap->ioaddr.lbam_addr);
+	tf->lbah = readb(ap->ioaddr.lbah_addr);
+
+	writeb(1 << 7, ap->ioaddr.ctl_addr);
+	tf->hob_feature = readb(ap->ioaddr.feature_addr);
+	tf->hob_nsect = readb(ap->ioaddr.nsect_addr);
+	tf->hob_lbal = readb(ap->ioaddr.lbal_addr);
+	tf->hob_lbam = readb(ap->ioaddr.lbam_addr);
+	tf->hob_lbah = readb(ap->ioaddr.lbah_addr);
+
+	writeb(0, ap->ioaddr.ctl_addr);
+	tf->device = readb(ap->ioaddr.device_addr);
+	tf->command = readb(ap->ioaddr.status_addr);
+#else
+	writeb(tf->ctl, ap->ioaddr.ctl_addr);
+	ata_sff_tf_read(ap, tf);
+#endif
+}
+
+/*
+ * Receives a 10 byte message from the other end
+ */
+static void mv_intr_c2c(struct ata_port *ap)
+{
+	int hard_port = mv_hardport_from_port(ap->port_no);
+	struct ata_taskfile tf;
+	void __iomem *hc_mmio;
+	u8 stat, msg[C2C_MSG_SIZE];
+
+	readb(ap->ioaddr.altstatus_addr);
+	stat = readb(ap->ioaddr.status_addr);
+
+	/* clear dev interrupt */
+	hc_mmio = mv_hc_base_from_port(mv_host_base(ap->host), hard_port);
+	writel(~((1 << 8) << hard_port), hc_mmio + HC_IRQ_CAUSE_OFS);
+
+	/* read registers */
+	mv_read_regs(ap, &tf);
+
+	msg[0] = tf.feature;
+	msg[1] = tf.lbal;
+	msg[2] = tf.lbam;
+	msg[3] = tf.lbah;
+	msg[4] = tf.device;
+	msg[5] = tf.hob_lbal;
+	msg[6] = tf.hob_lbam;
+	msg[7] = tf.hob_lbah;
+	msg[8] = tf.nsect;
+	msg[9] = tf.hob_nsect;
+
+	mv_c2c_callback(ap, C2CC_RDTH_FIS_DONE, msg, sizeof(msg));
+}
+
+static void mv_intr_bmdma(struct ata_port *ap, u32 edma_err)
+{
+	void __iomem *port_mmio = mv_ap_base(ap);
+	u32 edma_err_cause = 0;
+
+	mv_c2c_reset_bmdma(ap);
+	writel(0, port_mmio + SATA_IFCTL_OFS);
+
+	if (!edma_err)
+		mv_c2c_callback(ap, C2CC_BM_DONE, NULL, 0);
+	else {
+		edma_err_cause = readl(port_mmio + EDMA_ERR_IRQ_CAUSE_OFS);
+		if (edma_err_cause & ((1 << 17) | (1 << 26)))
+			mv_c2c_callback(ap, C2CC_BM_ERR, NULL, 0);
+		else if (edma_err_cause & ((1 << 13) | (1 << 21)))
+			mv_c2c_callback(ap, C2CC_RDTH_FIS_ERR, NULL, 0);
+	}
 }
 
 /**
@@ -1416,8 +2057,9 @@ static void mv_qc_prep(struct ata_queued_cmd *qc)
 	u16 flags = 0;
 	unsigned in_index;
 
-	if ((qc->tf.protocol != ATA_PROT_DMA) &&
-	    (qc->tf.protocol != ATA_PROT_NCQ))
+	if (((qc->tf.protocol != ATA_PROT_DMA) &&
+	    (qc->tf.protocol != ATA_PROT_NCQ)) ||
+	    (pp->pp_flags & MV_PP_FLAG_TARGET))
 		return;
 
 	/* Fill in command request block
@@ -1573,6 +2215,9 @@ static unsigned int mv_qc_issue(struct ata_queued_cmd *qc)
 	void __iomem *port_mmio = mv_ap_base(ap);
 	struct mv_port_priv *pp = ap->private_data;
 	u32 in_index;
+
+	if (pp->pp_flags & MV_PP_FLAG_MODE_INIT)
+		return mv_c2c_issue(ap, qc);
 
 	if ((qc->tf.protocol != ATA_PROT_DMA) &&
 	    (qc->tf.protocol != ATA_PROT_NCQ)) {
@@ -2000,7 +2645,7 @@ static void mv_process_crpb_entries(struct ata_port *ap, struct mv_port_priv *pp
 static void mv_port_intr(struct ata_port *ap, u32 port_cause)
 {
 	struct mv_port_priv *pp;
-	int edma_was_enabled;
+	int edma_was_enabled, bmdma_was_enabled;
 
 	if (!ap || (ap->flags & ATA_FLAG_DISABLED)) {
 		mv_unexpected_intr(ap, 0);
@@ -2013,6 +2658,8 @@ static void mv_port_intr(struct ata_port *ap, u32 port_cause)
 	 */
 	pp = ap->private_data;
 	edma_was_enabled = (pp->pp_flags & MV_PP_FLAG_EDMA_EN);
+	bmdma_was_enabled = pp->pp_flags & MV_PP_FLAG_BMDMA_EN;
+
 	/*
 	 * Process completed CRPB response(s) before other events.
 	 */
@@ -2020,18 +2667,24 @@ static void mv_port_intr(struct ata_port *ap, u32 port_cause)
 		mv_process_crpb_entries(ap, pp);
 		if (pp->pp_flags & MV_PP_FLAG_DELAYED_EH)
 			mv_handle_fbs_ncq_dev_err(ap);
-	}
+	} else if (edma_was_enabled && (port_cause & DONE_IRQ))
+		mv_intr_bmdma(ap, 0);
+
 	/*
 	 * Handle chip-reported errors, or continue on to handle PIO.
 	 */
 	if (unlikely(port_cause & ERR_IRQ)) {
 		mv_err_intr(ap);
-	} else if (!edma_was_enabled) {
-		struct ata_queued_cmd *qc = mv_get_active_qc(ap);
-		if (qc)
-			ata_sff_host_intr(ap, qc);
-		else
-			mv_unexpected_intr(ap, edma_was_enabled);
+	} else if ((!edma_was_enabled && !bmdma_was_enabled)) {
+		if (pp->pp_flags & MV_PP_FLAG_TARGET)
+			mv_intr_c2c(ap);
+		else {
+			struct ata_queued_cmd *qc = mv_get_active_qc(ap);
+			if (qc)
+				ata_sff_host_intr(ap, qc);
+			else
+				mv_unexpected_intr(ap, edma_was_enabled);
+		}
 	}
 }
 
@@ -3269,7 +3922,6 @@ static struct pci_driver mv_pci_driver = {
  */
 static int msi;	      /* Use PCI msi; either zero (off, default) or non-zero */
 
-
 /* move to PCI layer or libata core? */
 static int pci_go_64(struct pci_dev *pdev)
 {
@@ -3411,6 +4063,7 @@ static int mv_pci_init_one(struct pci_dev *pdev,
 
 	pci_set_master(pdev);
 	pci_try_set_mwi(pdev);
+
 	return ata_host_activate(host, pdev->irq, mv_interrupt, IRQF_SHARED,
 				 IS_GEN_I(hpriv) ? &mv5_sht : &mv6_sht);
 }
@@ -3455,6 +4108,13 @@ MODULE_ALIAS("platform:" DRV_NAME);
 module_param(msi, int, 0444);
 MODULE_PARM_DESC(msi, "Enable use of PCI MSI (0=off, 1=on)");
 #endif
+
+module_param(target_mode, int, 0444);
+MODULE_PARM_DESC(target_mode, "Run hardware as a SATA target (0=off, 1=on)");
+module_param(target_mode_size, int, 0444);
+MODULE_PARM_DESC(target_mode_size, "Size of SATA mode disk target (in MB)");
+module_param(target_mode_port, int, 0444);
+MODULE_PARM_DESC(target_mode_port, "SATA port to use for target mode");
 
 module_init(mv_init);
 module_exit(mv_exit);
