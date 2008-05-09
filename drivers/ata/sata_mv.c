@@ -221,6 +221,7 @@ enum {
 
 	/* SATA registers */
 	SATA_STATUS_OFS		= 0x300,  /* ctrl, err regs follow status */
+	SATA_CONTROL_OFS	= 0x308,
 	SATA_ACTIVE_OFS		= 0x350,
 	SATA_FIS_IRQ_CAUSE_OFS	= 0x364,
 
@@ -855,6 +856,7 @@ static void mv_set_edma_ptrs(void __iomem *port_mmio,
 {
 	u32 index;
 
+	printk("%s\n", __func__);
 	/*
 	 * initialize request queue
 	 */
@@ -907,6 +909,7 @@ static void mv_start_dma(struct ata_port *ap, void __iomem *port_mmio,
 {
 	int want_ncq = (protocol == ATA_PROT_NCQ);
 
+	printk("%s\n", __func__);
 	if (pp->pp_flags & MV_PP_FLAG_EDMA_EN) {
 		int using_ncq = ((pp->pp_flags & MV_PP_FLAG_NCQ_EN) != 0);
 		if (want_ncq != using_ncq)
@@ -949,6 +952,7 @@ static void mv_wait_for_edma_empty_idle(struct ata_port *ap)
 	const int per_loop = 5, timeout = (15 * 1000 / per_loop);
 	int i;
 
+	printk("%s\n", __func__);
 	/*
 	 * Wait for the EDMA engine to finish transactions in progress.
 	 * No idea what a good "timeout" value might be, but measurements
@@ -976,6 +980,7 @@ static int mv_stop_edma_engine(void __iomem *port_mmio)
 {
 	int i;
 
+	printk("%s\n", __func__);
 	/* Disable eDMA.  The disable bit auto clears. */
 	writelfl(EDMA_DS, port_mmio + EDMA_CMD_OFS);
 
@@ -994,6 +999,7 @@ static int mv_stop_edma(struct ata_port *ap)
 	void __iomem *port_mmio = mv_ap_base(ap);
 	struct mv_port_priv *pp = ap->private_data;
 
+	printk("%s\n", __func__);
 	if (!(pp->pp_flags & MV_PP_FLAG_EDMA_EN))
 		return 0;
 	pp->pp_flags &= ~MV_PP_FLAG_EDMA_EN;
@@ -1119,6 +1125,7 @@ static int mv_scr_write(struct ata_port *ap, unsigned int sc_reg_in, u32 val)
 {
 	unsigned int ofs = mv_scr_offset(sc_reg_in);
 
+	printk("%s: %x to %x\n", __func__, val, sc_reg_in);
 	if (ofs != 0xffffffffU) {
 		writelfl(val, mv_ap_base(ap) + ofs);
 		return 0;
@@ -1128,6 +1135,7 @@ static int mv_scr_write(struct ata_port *ap, unsigned int sc_reg_in, u32 val)
 
 static void mv6_dev_config(struct ata_device *adev)
 {
+	printk("%s\n", __func__);
 	/*
 	 * Deal with Gen-II ("mv6") hardware quirks/restrictions:
 	 *
@@ -1157,6 +1165,7 @@ static int mv_qc_defer(struct ata_queued_cmd *qc)
 	struct ata_port *ap = link->ap;
 	struct mv_port_priv *pp = ap->private_data;
 
+	printk("%s\n", __func__);
 	/*
 	 * Don't allow new commands if we're in a delayed EH state
 	 * for NCQ and/or FIS-based switching.
@@ -1202,6 +1211,7 @@ static void mv_config_fbs(void __iomem *port_mmio, int want_ncq, int want_fbs)
 	u32 new_ltmode, old_ltmode;
 	u32 new_haltcond, old_haltcond;
 
+	printk("%s\n", __func__);
 	old_fiscfg   = readl(port_mmio + FISCFG_OFS);
 	old_ltmode   = readl(port_mmio + LTMODE_OFS);
 	old_haltcond = readl(port_mmio + EDMA_HALTCOND_OFS);
@@ -1232,6 +1242,7 @@ static void mv_60x1_errata_sata25(struct ata_port *ap, int want_ncq)
 	struct mv_host_priv *hpriv = ap->host->private_data;
 	u32 old, new;
 
+	printk("%s\n", __func__);
 	/* workaround for 88SX60x1 FEr SATA#25 (part 1) */
 	old = readl(hpriv->base + MV_GPIO_PORT_CTL_OFS);
 	if (want_ncq)
@@ -1249,6 +1260,7 @@ static void mv_edma_cfg(struct ata_port *ap, int want_ncq)
 	struct mv_host_priv *hpriv = ap->host->private_data;
 	void __iomem *port_mmio    = mv_ap_base(ap);
 
+	printk("%s\n", __func__);
 	/* set up non-NCQ EDMA configuration */
 	cfg = EDMA_CFG_Q_DEPTH;		/* always 0x1f for *all* chips */
 	pp->pp_flags &= ~MV_PP_FLAG_FBS_EN;
@@ -1307,29 +1319,100 @@ static void mv_disable_target_mode(struct ata_port *ap)
 	reg &= ~(1 << 11);
 	reg |= 1 << 12;
 	writelfl(reg, port_mmio + SATA_INTERFACE_CFG_OFS);
+	pp->pp_flags &= ~MV_PP_FLAG_TARGET;
 	mv_reset_channel(hpriv, port_mmio, ap->port_no);
 
 	if (pp->pp_flags & MV_PP_FLAG_MODE_TARGET) {
 		sata_target_destroy(pp->target);
 		pp->target = NULL;
 	}
+}
 
-	pp->pp_flags &= ~MV_PP_FLAG_TARGET;
+static void mv_print_target_mode(struct ata_port *ap)
+{
+	void __iomem *port_mmio = mv_ap_base(ap);
+	u32 reg;
+
+	reg = readl(port_mmio + SATA_INTERFACE_CFG_OFS);
+	if (!(reg & (1 << 11)))
+		printk("ap%d: C2C not enabled\n", ap->port_no);
+	else if (reg & (1 << 10))
+		printk("ap%d: initiator mode\n", ap->port_no);
+	else
+		printk("ap%d: target mode\n", ap->port_no);
+}
+
+static int mv_check_status_post_hreset(struct ata_port *ap)
+{
+	void __iomem *port_mmio = mv_ap_base(ap);
+	u32 reg;
+
+	reg = readl(port_mmio + SATA_STATUS_OFS);
+	reg &= 3;
+	if (reg == 3 || !reg)
+		return 1;
+	return 0;
+}
+
+
+static void mv_establish_sata_comm(struct ata_port *ap)
+{
+	void __iomem *port_mmio = mv_ap_base(ap);
+	int i;
+
+	writelfl(0x301, port_mmio + SATA_CONTROL_OFS);
+	writelfl(0x300, port_mmio + SATA_CONTROL_OFS);
+
+	for (i = 0; i < 200; i++) {
+		if (mv_check_status_post_hreset(ap)) {
+			printk("phy ready after %d\n", i);
+			break;
+		}
+		mdelay(1);
+	}
+
+	if (i >= 200)
+		printk("mv_establish_sata_comm: timed out\n");
+}
+
+static void mv_set_c2c_mode(struct ata_port *ap)
+{
+	struct mv_port_priv *pp = ap->private_data;
+	void __iomem *port_mmio = mv_ap_base(ap);
+	u32 reg;
+
+	if (!(pp->pp_flags & MV_PP_FLAG_TARGET))
+		return;
+
+	/*
+	 * bit11 sets C2C comm mode, bit 12 is fix for 88SX60xx FEr SATA#8
+	 */
+	reg = readl(port_mmio + SATA_INTERFACE_CFG_OFS);
+	reg |= (1 << 11) | (1 << 12);
+	if (pp->pp_flags |= MV_PP_FLAG_MODE_INIT)
+		reg |= 1 << 10;
+	else
+		reg &= ~(1 << 10);
+
+	writel(0, port_mmio + EDMA_ERR_IRQ_CAUSE_OFS);
+	writelfl(reg, port_mmio + SATA_INTERFACE_CFG_OFS);
+	mv_print_target_mode(ap);
+
+	//mv_stop_edma_engine(port_mmio);
+	//mv_establish_sata_comm(ap);
 }
 
 static int mv_enable_target_mode(struct ata_port *ap, int mode)
 {
 	struct mv_host_priv *hpriv = ap->host->private_data;
 	struct mv_port_priv *pp = ap->private_data;
-	void __iomem *port_mmio = mv_ap_base(ap);
-	u32 reg;
 
 	if (IS_GEN_I(hpriv)) {
 		printk("sata_mv: target mode not supported on gen1\n");
 		return 1;
 	}
 
-	if (mode == MV_TARGET_MODE_TARGET && target_mode_port == ap->port_no) {
+	if (mode == MV_TARGET_MODE_TARGET) {
 		unsigned long sectors;
 
 		sectors = (target_mode_size * 1024) >> 1;
@@ -1341,21 +1424,34 @@ static int mv_enable_target_mode(struct ata_port *ap, int mode)
 		}
 	}
 
-	/*
-	 * bit11 sets C2C comm mode, bit 12 is fix for 88SX60xx FEr SATA#8
-	 */
-	reg = readl(port_mmio + SATA_INTERFACE_CFG_OFS);
-	reg |= (1 << 11) | (1 << 12);
-	if (mode == MV_TARGET_MODE_INITIATOR) {
-		reg |= 1 << 10;
+	if (mode == MV_TARGET_MODE_INITIATOR)
 		pp->pp_flags |= MV_PP_FLAG_MODE_INIT;
-	} else {
-		reg &= ~(1 << 10);
+	else
 		pp->pp_flags |= MV_PP_FLAG_MODE_TARGET;
+
+	mv_set_c2c_mode(ap);
+
+	if (mode == MV_TARGET_MODE_INITIATOR) {
+		struct ata_link *link;
+		struct ata_device *dev;
+
+		ata_port_for_each_link(link, ap) {
+			const unsigned long *timing =
+				sata_ehc_deb_timing(&link->eh_context);
+			int rc;
+			unsigned long deadline = 5 * HZ;
+			bool online;
+
+			rc = sata_link_hardreset(link, timing, deadline,
+						 &online, NULL);
+			if (rc)
+				printk("link: %d\n", rc);
+
+			ata_link_for_each_dev(dev, link)
+				dev->class = ATA_DEV_ATA;
+		}
 	}
 
-	writel(0, port_mmio + EDMA_ERR_IRQ_CAUSE_OFS);
-	writelfl(reg, port_mmio + SATA_INTERFACE_CFG_OFS);
 	return 0;
 }
 
@@ -1405,6 +1501,7 @@ static int mv_port_start(struct ata_port *ap)
 	struct mv_port_priv *pp;
 	int tag;
 
+	printk("%s\n", __func__);
 	pp = devm_kzalloc(dev, sizeof(*pp), GFP_KERNEL);
 	if (!pp)
 		return -ENOMEM;
@@ -1436,9 +1533,11 @@ static int mv_port_start(struct ata_port *ap)
 		}
 	}
 
-	if (target_mode != MV_TARGET_MODE_DISABLED) {
+	if (target_mode != MV_TARGET_MODE_DISABLED &&
+	    ap->port_no == target_mode_port) {
 		if (mv_enable_target_mode(ap, target_mode))
 			goto out_port_free_dma_mem;
+		mv_print_target_mode(ap);
 	}
 
 	return 0;
@@ -1461,6 +1560,7 @@ static void mv_port_stop(struct ata_port *ap)
 {
 	struct mv_port_priv *pp = ap->private_data;
 
+	printk("%s\n", __func__);
 	if (pp->pp_flags & MV_PP_FLAG_TARGET)
 		mv_disable_target_mode(ap);
 
@@ -1475,6 +1575,7 @@ static void __mv_fill_sg(struct mv_port_priv *pp, struct scatterlist *sgl,
 	struct scatterlist *sg;
 	unsigned int si;
 
+	printk("%s\n", __func__);
 	mv_sg = pp->sg_tbl[tag];
 	for_each_sg(sgl, sg, sg_elem, si) {
 		dma_addr_t addr = sg_dma_address(sg);
@@ -1516,6 +1617,7 @@ static void mv_fill_sg(struct ata_queued_cmd *qc)
 {
 	struct mv_port_priv *pp = qc->ap->private_data;
 
+	printk("%s\n", __func__);
 	__mv_fill_sg(pp, qc->sg, qc->n_elem, qc->tag);
 }
 
@@ -1533,6 +1635,7 @@ static void mv_clear_bmdone_intr(struct ata_port *ap)
 	void __iomem *hc_mmio;
 	u32 reg;
 
+	printk("%s\n", __func__);
 	hc_mmio = mv_hc_base_from_port(mv_host_base(ap->host), hard_port);
 	reg = readl(hc_mmio + HC_IRQ_CAUSE_OFS);
 	reg &= ~(1 << hard_port);
@@ -1546,6 +1649,7 @@ static void mv_c2c_reset_bmdma(struct ata_port *ap)
 	void __iomem *port_mmio = mv_ap_base(ap);
 	u32 reg;
 
+	printk("%s\n", __func__);
 	reg = readl(port_mmio + BMDMA_CMD_OFS);
 	reg &= ~0x1;
 	writel(reg, port_mmio + BMDMA_CMD_OFS);
@@ -1567,13 +1671,13 @@ static int mv_send_vu_fis(struct ata_port *ap, u32 *buffer, unsigned int words)
 	}
 
 	/* set VU mode */
-	writel(1 << 8, port_mmio + SATA_IFCTL_OFS);
+	writel((1 << 8), port_mmio + SATA_IFCTL_OFS);
 
 	for (i = 1; i < words; i++)
 		writel(buffer[i - 1], port_mmio + VENDOR_UNIQUE_FIS_OFS);
 
 	writel((1 << 8) | (1 << 9), port_mmio + SATA_IFCTL_OFS);
-	writel(buffer[words - 1], port_mmio + VENDOR_UNIQUE_FIS_OFS);
+	writel(buffer[i - 1], port_mmio + VENDOR_UNIQUE_FIS_OFS);
 
 	for (i = 0; i < 200; i++) {
 		reg = readl(port_mmio + SATA_IFSTAT_OFS);
@@ -1591,8 +1695,14 @@ static int mv_send_vu_fis(struct ata_port *ap, u32 *buffer, unsigned int words)
 	/* clear VU mode */
 	writel(0, port_mmio + SATA_IFCTL_OFS);
 
+	if (i >= 200) {
+		printk(KERN_ERR "mv_send_vu_fis: timed out\n");
+		ret = -ETIMEDOUT;
+	}
 	if (ret)
 		printk(KERN_ERR "mv_send_vu_fis: stat %x\n", reg);
+	else
+		printk("mv_send_vu_fis: OK!\n");
 
 	return ret;
 }
@@ -1604,6 +1714,7 @@ static void mv_activate_bmdma(struct ata_port *ap, unsigned int tag,
 	void __iomem *port_mmio = mv_ap_base(ap);
 	u32 addr_lo, addr_hi;
 
+	printk("%s\n", __func__);
 	WARN_ON(pp->pp_flags & MV_PP_FLAG_BMDMA_EN);
 
 	pp->pp_flags |= MV_PP_FLAG_BMDMA_EN;
@@ -1616,9 +1727,9 @@ static void mv_activate_bmdma(struct ata_port *ap, unsigned int tag,
 	writel(addr_hi, port_mmio + BMDMA_PRD_HI_OFS);
 
 	if (dma_dir == DMA_FROM_DEVICE)
-		writeb((1 << 3) | (1 << 0), port_mmio + BMDMA_CMD_OFS);
+		writel((1 << 3) | (1 << 0), port_mmio + BMDMA_CMD_OFS);
 	else
-		writeb((1 << 0), port_mmio + BMDMA_CMD_OFS);
+		writel((1 << 0), port_mmio + BMDMA_CMD_OFS);
 }
 
 static int mv_c2c_activate_dma(struct ata_port *ap, unsigned int tag,
@@ -1628,6 +1739,7 @@ static int mv_c2c_activate_dma(struct ata_port *ap, unsigned int tag,
 	void __iomem *port_mmio = mv_ap_base(ap);
 	int ret = 0;
 
+	printk("%s\n", __func__);
 	if (pp->pp_flags & MV_PP_FLAG_MODE_TARGET) {
 		enum dma_data_direction target_dma_dir;
 
@@ -1664,6 +1776,7 @@ static int mv_c2c_send_rdth_fis(struct ata_port *ap, u8 *msg, int r_intr)
 {
 	u32 buffer[5];
 
+	printk("%s\n", __func__);
 	buffer[0] = C2C_REG_HOST_DEVICE_FIS;
 	if (r_intr)
 		buffer[0] |= 1 << 14;
@@ -1684,8 +1797,9 @@ enum c2cc_event {
 
 static void mv_c2c_complete(struct ata_port *ap, int tag, int err)
 {
-	struct ata_queued_cmd *qc = &ap->qcmd[tag];
+	struct ata_queued_cmd *qc = ata_qc_from_tag(ap, tag);
 
+	printk("%s\n", __func__);
 	if (qc) {
 		if (err)
 			qc->err_mask |= AC_ERR_DEV;
@@ -1697,6 +1811,7 @@ static void mv_c2c_complete(struct ata_port *ap, int tag, int err)
 static void mv_c2c_initiator_rdth_fis_reply(struct ata_port *ap, u8 *msg,
 					    u32 msg_size)
 {
+	printk("%s\n", __func__);
 	switch (msg[0]) {
 	case C2C_MSG_SETF:
 		mv_c2c_complete(ap, 0, msg[3] != 0);
@@ -1715,6 +1830,7 @@ static void mv_c2c_target_rdth_fis_reply(struct ata_port *ap, u8 *msg,
 	int dma_dir = DMA_FROM_DEVICE;
 	u8 tag;
 
+	printk("%s\n", __func__);
 	switch (msg[0]) {
 	case C2C_MSG_WRITE:
 		dma_dir = DMA_TO_DEVICE;
@@ -1809,7 +1925,10 @@ static void mv_c2c_initiator_callback(struct ata_port *ap, enum c2cc_event ev,
 		stat = 1;
 	case C2CC_BM_DONE:
 		printk("mv_c2c_initiator_callback: bm done %d\n", stat);
-		tag = msg[9];
+		if (msg)
+			tag = msg[9];
+		else
+			tag = ap->link.active_tag;
 		mv_c2c_complete(ap, tag, stat);
 		break;
 	case C2CC_RDTH_FIS_ERR:
@@ -1838,7 +1957,10 @@ static void mv_c2c_target_callback(struct ata_port *ap, enum c2cc_event ev,
 	case C2CC_BM_ERR:
 		stat = 1;
 	case C2CC_BM_DONE:
-		tag = msg[9];
+		if (msg)
+			tag = msg[9];
+		else
+			tag = 0;
 		sata_target_unmap_sg(st, tag);
 		printk("mv_c2c_target_callback: bm done %d\n", stat);
 		break;
@@ -1959,6 +2081,7 @@ static int mv_c2c_issue(struct ata_port *ap, struct ata_queued_cmd *qc)
 
 static void mv_read_regs(struct ata_port *ap, struct ata_taskfile *tf)
 {
+	printk("%s\n", __func__);
 #if 0
 	writeb(0, ap->ioaddr.ctl_addr);
 	tf->feature = readb(ap->ioaddr.feature_addr);
@@ -1993,6 +2116,7 @@ static void mv_intr_c2c(struct ata_port *ap)
 	void __iomem *hc_mmio;
 	u8 stat, msg[C2C_MSG_SIZE];
 
+	printk("%s\n", __func__);
 	readb(ap->ioaddr.altstatus_addr);
 	stat = readb(ap->ioaddr.status_addr);
 
@@ -2022,6 +2146,7 @@ static void mv_intr_bmdma(struct ata_port *ap, u32 edma_err)
 	void __iomem *port_mmio = mv_ap_base(ap);
 	u32 edma_err_cause = 0;
 
+	printk("%s\n", __func__);
 	mv_c2c_reset_bmdma(ap);
 	writel(0, port_mmio + SATA_IFCTL_OFS);
 
@@ -2216,6 +2341,7 @@ static unsigned int mv_qc_issue(struct ata_queued_cmd *qc)
 	struct mv_port_priv *pp = ap->private_data;
 	u32 in_index;
 
+	printk("%s\n", __func__);
 	if (pp->pp_flags & MV_PP_FLAG_MODE_INIT)
 		return mv_c2c_issue(ap, qc);
 
@@ -2261,6 +2387,7 @@ static void mv_pmp_error_handler(struct ata_port *ap)
 	unsigned int pmp, pmp_map;
 	struct mv_port_priv *pp = ap->private_data;
 
+	printk("%s\n", __func__);
 	if (pp->pp_flags & MV_PP_FLAG_DELAYED_EH) {
 		/*
 		 * Perform NCQ error analysis on failed PMPs
@@ -2287,6 +2414,7 @@ static unsigned int mv_get_err_pmp_map(struct ata_port *ap)
 {
 	void __iomem *port_mmio = mv_ap_base(ap);
 
+	printk("%s\n", __func__);
 	return readl(port_mmio + SATA_TESTCTL_OFS) >> 16;
 }
 
@@ -2295,6 +2423,7 @@ static void mv_pmp_eh_prep(struct ata_port *ap, unsigned int pmp_map)
 	struct ata_eh_info *ehi;
 	unsigned int pmp;
 
+	printk("%s\n", __func__);
 	/*
 	 * Initialize EH info for PMPs which saw device errors
 	 */
@@ -2321,6 +2450,7 @@ static int mv_handle_fbs_ncq_dev_err(struct ata_port *ap)
 	int failed_links;
 	unsigned int old_map, new_map;
 
+	printk("%s\n", __func__);
 	/*
 	 * Device error during FBS+NCQ operation:
 	 *
@@ -2379,6 +2509,7 @@ static int mv_handle_dev_err(struct ata_port *ap, u32 edma_err_cause)
 {
 	struct mv_port_priv *pp = ap->private_data;
 
+	printk("%s\n", __func__);
 	if (!(pp->pp_flags & MV_PP_FLAG_EDMA_EN))
 		return 0;	/* EDMA was not active: not handled */
 	if (!(pp->pp_flags & MV_PP_FLAG_FBS_EN))
@@ -2425,6 +2556,7 @@ static void mv_unexpected_intr(struct ata_port *ap, int edma_was_enabled)
 	struct ata_eh_info *ehi = &ap->link.eh_info;
 	char *when = "idle";
 
+	printk("%s\n", __func__);
 	ata_ehi_clear_desc(ehi);
 	if (!ap || (ap->flags & ATA_FLAG_DISABLED)) {
 		when = "disabled";
@@ -2464,6 +2596,7 @@ static void mv_err_intr(struct ata_port *ap)
 	struct ata_queued_cmd *qc;
 	int abort = 0;
 
+	printk("%s\n", __func__);
 	/*
 	 * Read and clear the SError and err_cause bits.
 	 */
@@ -2577,6 +2710,7 @@ static void mv_process_crpb_response(struct ata_port *ap,
 {
 	struct ata_queued_cmd *qc = ata_qc_from_tag(ap, tag);
 
+	printk("%s\n", __func__);
 	if (qc) {
 		u8 ata_status;
 		u16 edma_status = le16_to_cpu(response->flags);
@@ -2613,6 +2747,7 @@ static void mv_process_crpb_entries(struct ata_port *ap, struct mv_port_priv *pp
 	bool work_done = false;
 	int ncq_enabled = (pp->pp_flags & MV_PP_FLAG_NCQ_EN);
 
+	printk("%s\n", __func__);
 	/* Get the hardware queue position index */
 	in_index = (readl(port_mmio + EDMA_RSP_Q_IN_PTR_OFS)
 			>> EDMA_RSP_Q_PTR_SHIFT) & MV_MAX_Q_DEPTH_MASK;
@@ -2647,6 +2782,7 @@ static void mv_port_intr(struct ata_port *ap, u32 port_cause)
 	struct mv_port_priv *pp;
 	int edma_was_enabled, bmdma_was_enabled;
 
+	printk("%s\n", __func__);
 	if (!ap || (ap->flags & ATA_FLAG_DISABLED)) {
 		mv_unexpected_intr(ap, 0);
 		return;
@@ -2667,7 +2803,7 @@ static void mv_port_intr(struct ata_port *ap, u32 port_cause)
 		mv_process_crpb_entries(ap, pp);
 		if (pp->pp_flags & MV_PP_FLAG_DELAYED_EH)
 			mv_handle_fbs_ncq_dev_err(ap);
-	} else if (edma_was_enabled && (port_cause & DONE_IRQ))
+	} else if (bmdma_was_enabled && (port_cause & DONE_IRQ))
 		mv_intr_bmdma(ap, 0);
 
 	/*
@@ -2702,6 +2838,7 @@ static int mv_host_intr(struct ata_host *host, u32 main_irq_cause)
 	void __iomem *mmio = hpriv->base, *hc_mmio;
 	unsigned int handled = 0, port;
 
+	printk("%s\n", __func__);
 	for (port = 0; port < hpriv->n_ports; port++) {
 		struct ata_port *ap = host->ports[port];
 		unsigned int p, shift, hardport, port_cause;
@@ -2764,6 +2901,7 @@ static int mv_pci_error(struct ata_host *host, void __iomem *mmio)
 	unsigned int i, err_mask, printed = 0;
 	u32 err_cause;
 
+	printk("%s\n", __func__);
 	err_cause = readl(mmio + hpriv->irq_cause_ofs);
 
 	dev_printk(KERN_ERR, host->dev, "PCI ERROR; PCI IRQ cause=0x%08x\n",
@@ -2817,6 +2955,7 @@ static irqreturn_t mv_interrupt(int irq, void *dev_instance)
 	unsigned int handled = 0;
 	u32 main_irq_cause, main_irq_mask;
 
+	printk("%s\n", __func__);
 	spin_lock(&host->lock);
 	main_irq_cause = readl(hpriv->main_irq_cause_addr);
 	main_irq_mask  = readl(hpriv->main_irq_mask_addr);
@@ -2838,6 +2977,7 @@ static unsigned int mv5_scr_offset(unsigned int sc_reg_in)
 {
 	unsigned int ofs;
 
+	printk("%s\n", __func__);
 	switch (sc_reg_in) {
 	case SCR_STATUS:
 	case SCR_ERROR:
@@ -2858,6 +2998,7 @@ static int mv5_scr_read(struct ata_port *ap, unsigned int sc_reg_in, u32 *val)
 	void __iomem *addr = mv5_phy_base(mmio, ap->port_no);
 	unsigned int ofs = mv5_scr_offset(sc_reg_in);
 
+	printk("%s\n", __func__);
 	if (ofs != 0xffffffffU) {
 		*val = readl(addr + ofs);
 		return 0;
@@ -2872,6 +3013,7 @@ static int mv5_scr_write(struct ata_port *ap, unsigned int sc_reg_in, u32 val)
 	void __iomem *addr = mv5_phy_base(mmio, ap->port_no);
 	unsigned int ofs = mv5_scr_offset(sc_reg_in);
 
+	printk("%s\n", __func__);
 	if (ofs != 0xffffffffU) {
 		writelfl(val, addr + ofs);
 		return 0;
@@ -2884,6 +3026,7 @@ static void mv5_reset_bus(struct ata_host *host, void __iomem *mmio)
 	struct pci_dev *pdev = to_pci_dev(host->dev);
 	int early_5080;
 
+	printk("%s\n", __func__);
 	early_5080 = (pdev->device == 0x5080) && (pdev->revision == 0);
 
 	if (!early_5080) {
@@ -2897,6 +3040,7 @@ static void mv5_reset_bus(struct ata_host *host, void __iomem *mmio)
 
 static void mv5_reset_flash(struct mv_host_priv *hpriv, void __iomem *mmio)
 {
+	printk("%s\n", __func__);
 	writel(0x0fcfffff, mmio + MV_FLASH_CTL_OFS);
 }
 
@@ -2906,6 +3050,7 @@ static void mv5_read_preamp(struct mv_host_priv *hpriv, int idx,
 	void __iomem *phy_mmio = mv5_phy_base(mmio, idx);
 	u32 tmp;
 
+	printk("%s\n", __func__);
 	tmp = readl(phy_mmio + MV5_PHY_MODE);
 
 	hpriv->signal[idx].pre = tmp & 0x1800;	/* bits 12:11 */
@@ -2915,6 +3060,7 @@ static void mv5_read_preamp(struct mv_host_priv *hpriv, int idx,
 static void mv5_enable_leds(struct mv_host_priv *hpriv, void __iomem *mmio)
 {
 	u32 tmp;
+	printk("%s\n", __func__);
 
 	writel(0, mmio + MV_GPIO_PORT_CTL_OFS);
 
@@ -2933,6 +3079,7 @@ static void mv5_phy_errata(struct mv_host_priv *hpriv, void __iomem *mmio,
 	u32 tmp;
 	int fix_apm_sq = (hpriv->hp_flags & MV_HP_ERRATA_50XXB0);
 
+	printk("%s\n", __func__);
 	if (fix_apm_sq) {
 		tmp = readl(phy_mmio + MV5_LTMODE_OFS);
 		tmp |= (1 << 19);
@@ -2959,6 +3106,7 @@ static void mv5_reset_hc_port(struct mv_host_priv *hpriv, void __iomem *mmio,
 {
 	void __iomem *port_mmio = mv_port_base(mmio, port);
 
+	printk("%s\n", __func__);
 	mv_reset_channel(hpriv, mmio, port);
 
 	ZERO(0x028);	/* command */
@@ -2984,6 +3132,7 @@ static void mv5_reset_one_hc(struct mv_host_priv *hpriv, void __iomem *mmio,
 	void __iomem *hc_mmio = mv_hc_base(mmio, hc);
 	u32 tmp;
 
+	printk("%s\n", __func__);
 	ZERO(0x00c);
 	ZERO(0x010);
 	ZERO(0x014);
@@ -3001,6 +3150,7 @@ static int mv5_reset_hc(struct mv_host_priv *hpriv, void __iomem *mmio,
 {
 	unsigned int hc, port;
 
+	printk("%s\n", __func__);
 	for (hc = 0; hc < n_hc; hc++) {
 		for (port = 0; port < MV_PORTS_PER_HC; port++)
 			mv5_reset_hc_port(hpriv, mmio,
@@ -3019,6 +3169,7 @@ static void mv_reset_pci_bus(struct ata_host *host, void __iomem *mmio)
 	struct mv_host_priv *hpriv = host->private_data;
 	u32 tmp;
 
+	printk("%s\n", __func__);
 	tmp = readl(mmio + MV_PCI_MODE_OFS);
 	tmp &= 0xff00ffff;
 	writel(tmp, mmio + MV_PCI_MODE_OFS);
@@ -3041,6 +3192,7 @@ static void mv6_reset_flash(struct mv_host_priv *hpriv, void __iomem *mmio)
 {
 	u32 tmp;
 
+	printk("%s\n", __func__);
 	mv5_reset_flash(hpriv, mmio);
 
 	tmp = readl(mmio + MV_GPIO_PORT_CTL_OFS);
@@ -3065,6 +3217,7 @@ static int mv6_reset_hc(struct mv_host_priv *hpriv, void __iomem *mmio,
 	int i, rc = 0;
 	u32 t;
 
+	printk("%s\n", __func__);
 	/* Following procedure defined in PCI "main command and status
 	 * register" table.
 	 */
@@ -3119,6 +3272,7 @@ static void mv6_read_preamp(struct mv_host_priv *hpriv, int idx,
 	void __iomem *port_mmio;
 	u32 tmp;
 
+	printk("%s\n", __func__);
 	tmp = readl(mmio + MV_RESET_CFG_OFS);
 	if ((tmp & (1 << 0)) == 0) {
 		hpriv->signal[idx].amps = 0x7 << 8;
@@ -3135,12 +3289,14 @@ static void mv6_read_preamp(struct mv_host_priv *hpriv, int idx,
 
 static void mv6_enable_leds(struct mv_host_priv *hpriv, void __iomem *mmio)
 {
+	printk("%s\n", __func__);
 	writel(0x00000060, mmio + MV_GPIO_PORT_CTL_OFS);
 }
 
 static void mv6_phy_errata(struct mv_host_priv *hpriv, void __iomem *mmio,
 			   unsigned int port)
 {
+#if 0
 	void __iomem *port_mmio = mv_port_base(mmio, port);
 
 	u32 hp_flags = hpriv->hp_flags;
@@ -3150,6 +3306,7 @@ static void mv6_phy_errata(struct mv_host_priv *hpriv, void __iomem *mmio,
 		hp_flags & (MV_HP_ERRATA_60X1B2 | MV_HP_ERRATA_60X1C0);
 	u32 m2, tmp;
 
+	printk("%s\n", __func__);
 	if (fix_phy_mode2) {
 		m2 = readl(port_mmio + PHY_MODE2);
 		m2 &= ~(1 << 16);
@@ -3203,6 +3360,7 @@ static void mv6_phy_errata(struct mv_host_priv *hpriv, void __iomem *mmio,
 	}
 
 	writel(m2, port_mmio + PHY_MODE2);
+#endif
 }
 
 /* TODO: use the generic LED interface to configure the SATA Presence */
@@ -3219,6 +3377,7 @@ static void mv_soc_read_preamp(struct mv_host_priv *hpriv, int idx,
 	void __iomem *port_mmio;
 	u32 tmp;
 
+	printk("%s\n", __func__);
 	port_mmio = mv_port_base(mmio, idx);
 	tmp = readl(port_mmio + PHY_MODE2);
 
@@ -3233,6 +3392,7 @@ static void mv_soc_reset_hc_port(struct mv_host_priv *hpriv,
 {
 	void __iomem *port_mmio = mv_port_base(mmio, port);
 
+	printk("%s\n", __func__);
 	mv_reset_channel(hpriv, mmio, port);
 
 	ZERO(0x028);		/* command */
@@ -3258,6 +3418,7 @@ static void mv_soc_reset_one_hc(struct mv_host_priv *hpriv,
 {
 	void __iomem *hc_mmio = mv_hc_base(mmio, 0);
 
+	printk("%s\n", __func__);
 	ZERO(0x00c);
 	ZERO(0x010);
 	ZERO(0x014);
@@ -3271,6 +3432,7 @@ static int mv_soc_reset_hc(struct mv_host_priv *hpriv,
 {
 	unsigned int port;
 
+	printk("%s\n", __func__);
 	for (port = 0; port < hpriv->n_ports; port++)
 		mv_soc_reset_hc_port(hpriv, mmio, port);
 
@@ -3292,8 +3454,9 @@ static void mv_soc_reset_bus(struct ata_host *host, void __iomem *mmio)
 
 static void mv_setup_ifcfg(void __iomem *port_mmio, int want_gen2i)
 {
-	u32 ifcfg = readl(port_mmio + SATA_INTERFACE_CFG_OFS);
+	u32 ifcfg;
 
+	ifcfg = readl(port_mmio + SATA_INTERFACE_CFG_OFS);
 	ifcfg = (ifcfg & 0xf7f) | 0x9b1000;	/* from chip spec */
 	if (want_gen2i)
 		ifcfg |= (1 << 7);		/* enable gen2i speed */
@@ -3305,18 +3468,22 @@ static void mv_reset_channel(struct mv_host_priv *hpriv, void __iomem *mmio,
 {
 	void __iomem *port_mmio = mv_port_base(mmio, port_no);
 
+	printk("%s\n", __func__);
 	/*
 	 * The datasheet warns against setting EDMA_RESET when EDMA is active
 	 * (but doesn't say what the problem might be).  So we first try
 	 * to disable the EDMA engine before doing the EDMA_RESET operation.
 	 */
-	mv_stop_edma_engine(port_mmio);
+	//if (pp->pp_flags & MV_PP_FLAG_EDMA_EN)
+		mv_stop_edma_engine(port_mmio);
+
 	writelfl(EDMA_RESET, port_mmio + EDMA_CMD_OFS);
 
 	if (!IS_GEN_I(hpriv)) {
 		/* Enable 3.0gb/s link speed: this survives EDMA_RESET */
 		mv_setup_ifcfg(port_mmio, 1);
 	}
+
 	/*
 	 * Strobing EDMA_RESET here causes a hard reset of the SATA transport,
 	 * link, and physical layers.  It resets all SATA interface registers
@@ -3334,6 +3501,7 @@ static void mv_reset_channel(struct mv_host_priv *hpriv, void __iomem *mmio,
 
 static void mv_pmp_select(struct ata_port *ap, int pmp)
 {
+	printk("%s\n", __func__);
 	if (sata_pmp_supported(ap)) {
 		void __iomem *port_mmio = mv_ap_base(ap);
 		u32 reg = readl(port_mmio + SATA_IFCTL_OFS);
@@ -3349,6 +3517,7 @@ static void mv_pmp_select(struct ata_port *ap, int pmp)
 static int mv_pmp_hardreset(struct ata_link *link, unsigned int *class,
 				unsigned long deadline)
 {
+	printk("%s\n", __func__);
 	mv_pmp_select(link->ap, sata_srst_pmp(link));
 	return sata_std_hardreset(link, class, deadline);
 }
@@ -3356,6 +3525,7 @@ static int mv_pmp_hardreset(struct ata_link *link, unsigned int *class,
 static int mv_softreset(struct ata_link *link, unsigned int *class,
 				unsigned long deadline)
 {
+	printk("%s\n", __func__);
 	mv_pmp_select(link->ap, sata_srst_pmp(link));
 	return ata_sff_softreset(link, class, deadline);
 }
@@ -3371,8 +3541,10 @@ static int mv_hardreset(struct ata_link *link, unsigned int *class,
 	u32 sstatus;
 	bool online;
 
+	printk("%s\n", __func__);
 	mv_reset_channel(hpriv, mmio, ap->port_no);
 	pp->pp_flags &= ~MV_PP_FLAG_EDMA_EN;
+	pp->pp_flags &= ~MV_PP_FLAG_BMDMA_EN;
 
 	/* Workaround for errata FEr SATA#10 (part 2) */
 	do {
@@ -3380,7 +3552,7 @@ static int mv_hardreset(struct ata_link *link, unsigned int *class,
 				sata_ehc_deb_timing(&link->eh_context);
 
 		rc = sata_link_hardreset(link, timing, deadline + extra,
-					 &online, NULL);
+						&online, NULL);
 		if (rc)
 			return rc;
 		sata_scr_read(link, SCR_STATUS, &sstatus);
@@ -3401,6 +3573,8 @@ static void mv_eh_freeze(struct ata_port *ap)
 	unsigned int shift, hardport, port = ap->port_no;
 	u32 main_irq_mask;
 
+	printk("%s\n", __func__);
+	return;
 	/* FIXME: handle coalescing completion events properly */
 
 	mv_stop_edma(ap);
@@ -3420,6 +3594,7 @@ static void mv_eh_thaw(struct ata_port *ap)
 	void __iomem *port_mmio = mv_ap_base(ap);
 	u32 main_irq_mask, hc_irq_cause;
 
+	printk("%s\n", __func__);
 	/* FIXME: handle coalescing completion events properly */
 
 	MV_PORT_TO_SHIFT_AND_HARDPORT(port, shift, hardport);
@@ -3436,6 +3611,7 @@ static void mv_eh_thaw(struct ata_port *ap)
 	main_irq_mask = readl(hpriv->main_irq_mask_addr);
 	main_irq_mask |= ((DONE_IRQ | ERR_IRQ) << shift);
 	writelfl(main_irq_mask, hpriv->main_irq_mask_addr);
+
 }
 
 /**

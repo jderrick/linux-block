@@ -168,7 +168,7 @@ static int size_ok(unsigned long nr_pages)
 	struct sysinfo si;
 
 	si_meminfo(&si);
-	sys_pages = si.totalram >> PAGE_SHIFT;
+	sys_pages = si.totalram;
 	reserve_pages = (RESERVE_MB * 1024UL * 1024UL) >> PAGE_SHIFT;
 	if (sys_pages < reserve_pages)
 		return 0;
