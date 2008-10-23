@@ -296,15 +296,15 @@ EXPORT_SYMBOL(scsi_get_command);
 void __scsi_put_command(struct Scsi_Host *shost, struct scsi_cmnd *cmd,
 			struct device *dev)
 {
-	unsigned long flags;
-
-	/* changing locks here, don't need to restore the irq state */
-	spin_lock_irqsave(&shost->free_list_lock, flags);
+	smp_mb();
 	if (unlikely(list_empty(&shost->free_list))) {
+		unsigned long flags;
+
+		spin_lock_irqsave(&shost->free_list_lock, flags);
 		list_add(&cmd->list, &shost->free_list);
+		spin_unlock_irqrestore(&shost->free_list_lock, flags);
 		cmd = NULL;
 	}
-	spin_unlock_irqrestore(&shost->free_list_lock, flags);
 
 	if (likely(cmd != NULL))
 		scsi_pool_free_command(shost->cmd_pool, cmd);
