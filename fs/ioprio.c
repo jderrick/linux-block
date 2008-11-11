@@ -29,7 +29,7 @@
 
 static int set_task_ioprio(struct task_struct *task, int ioprio)
 {
-	int err;
+	int err, i;
 	struct io_context *ioc;
 
 	if (task->uid != current->euid &&
@@ -53,12 +53,17 @@ static int set_task_ioprio(struct task_struct *task, int ioprio)
 			err = -ENOMEM;
 			break;
 		}
+		/* let other ioc users see the new values */
+		smp_wmb();
 		task->io_context = ioc;
 	} while (1);
 
 	if (!err) {
 		ioc->ioprio = ioprio;
-		ioc->ioprio_changed = 1;
+		/* make sure schedulers see the new ioprio value */
+		wmb();
+		for (i = 0; i < IOC_IOPRIO_CHANGED_BITS; i++)
+			set_bit(i, ioc->ioprio_changed);
 	}
 
 	task_unlock(task);
