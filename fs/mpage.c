@@ -180,10 +180,17 @@ do_mpage_readpage(struct bio *bio, struct page *page, unsigned nr_pages,
 	unsigned page_block;
 	unsigned first_hole = blocks_per_page;
 	struct block_device *bdev = NULL;
-	int length;
+	int length, rw;
 	int fully_mapped = 1;
 	unsigned nblocks;
 	unsigned relative_block;
+
+	/*
+	 * If there's some read-ahead in this range, be sure to tell
+	 * the block layer about it. We start off as a READ, then switch
+	 * to READA if we spot the read-ahead marker on the page.
+	 */
+	rw = READ;
 
 	if (page_has_buffers(page))
 		goto confused;
@@ -289,7 +296,7 @@ do_mpage_readpage(struct bio *bio, struct page *page, unsigned nr_pages,
 	 * This page will go to BIO.  Do we need to send this BIO off first?
 	 */
 	if (bio && (*last_block_in_bio != blocks[0] - 1))
-		bio = mpage_bio_submit(READ, bio);
+		bio = mpage_bio_submit(rw, bio);
 
 alloc_new:
 	if (bio == NULL) {
@@ -301,8 +308,19 @@ alloc_new:
 	}
 
 	length = first_hole << blkbits;
-	if (bio_add_page(bio, page, length, 0) < length) {
-		bio = mpage_bio_submit(READ, bio);
+
+	/*
+	 * If this is an SSD, don't merge the read-ahead part of the IO
+	 * with the actual request. We want the interesting part to complete
+	 * as quickly as possible.
+	 */
+	if (blk_queue_nonrot(bdev_get_queue(bdev)) &&
+	    bio->bi_size && PageReadahead(page)) {
+		bio = mpage_bio_submit(rw, bio);
+		rw = READA;
+		goto alloc_new;
+	} else if (bio_add_page(bio, page, length, 0) < length) {
+		bio = mpage_bio_submit(rw, bio);
 		goto alloc_new;
 	}
 
@@ -310,7 +328,7 @@ alloc_new:
 	nblocks = map_bh->b_size >> blkbits;
 	if ((buffer_boundary(map_bh) && relative_block == nblocks) ||
 	    (first_hole != blocks_per_page))
-		bio = mpage_bio_submit(READ, bio);
+		bio = mpage_bio_submit(rw, bio);
 	else
 		*last_block_in_bio = blocks[blocks_per_page - 1];
 out:
@@ -318,7 +336,7 @@ out:
 
 confused:
 	if (bio)
-		bio = mpage_bio_submit(READ, bio);
+		bio = mpage_bio_submit(rw, bio);
 	if (!PageUptodate(page))
 	        block_read_full_page(page, get_block);
 	else

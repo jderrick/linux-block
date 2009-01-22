@@ -62,6 +62,13 @@ static int elv_iosched_allow_merge(struct request *rq, struct bio *bio)
 {
 	struct request_queue *q = rq->q;
 
+	/*
+	 * Disallow merge of a read-ahead bio into a normal request for SSD
+	 */
+	if (blk_queue_nonrot(q) && bio_rw_flagged(bio, BIO_RW_AHEAD) &&
+	    blk_failfast_dev(rq))
+		return 0;
+
 	if (q->elv_ops.elevator_allow_merge_fn)
 		return elv_call_allow_merge_fn(q, rq, bio);
 
