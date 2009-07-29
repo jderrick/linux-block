@@ -613,17 +613,56 @@ int blk_get_queue(struct request_queue *q)
 	return 1;
 }
 
+static struct request *blk_rq_cache_alloc(struct request_queue *q)
+{
+	int tag;
+
+	do {
+		if (q->rq_cache_last != -1) {
+			tag = q->rq_cache_last;
+			q->rq_cache_last = -1;
+		} else {
+			tag = find_first_zero_bit(q->rq_cache_map,
+							q->rq_cache_sz);
+		}
+		if (tag >= q->rq_cache_sz)
+			return NULL;
+	} while (test_and_set_bit_lock(tag, q->rq_cache_map));
+
+	return &q->rq_cache[tag];
+}
+
+static int blk_rq_cache_free(struct request_queue *q, struct request *rq)
+{
+	if (!q->rq_cache)
+		return 1;
+	if (rq >= &q->rq_cache[0] && rq <= &q->rq_cache[q->rq_cache_sz - 1]) {
+		unsigned long idx = rq - q->rq_cache;
+
+		clear_bit(idx, q->rq_cache_map);
+		q->rq_cache_last = idx;
+		return 0;
+	}
+
+	return 1;
+}
+
 static inline void blk_free_request(struct request_queue *q, struct request *rq)
 {
 	if (rq->cmd_flags & REQ_ELVPRIV)
 		elv_put_request(q, rq);
-	mempool_free(rq, q->rq.rq_pool);
+	if (blk_rq_cache_free(q, rq))
+		mempool_free(rq, q->rq.rq_pool);
 }
 
 static struct request *
 blk_alloc_request(struct request_queue *q, int flags, int priv, gfp_t gfp_mask)
 {
-	struct request *rq = mempool_alloc(q->rq.rq_pool, gfp_mask);
+	struct request *rq;
+
+	rq = blk_rq_cache_alloc(q);
+	if (!rq)
+		rq = mempool_alloc(q->rq.rq_pool, gfp_mask);
 
 	if (!rq)
 		return NULL;

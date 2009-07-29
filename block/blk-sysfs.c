@@ -254,6 +254,68 @@ static ssize_t queue_iostats_store(struct request_queue *q, const char *page,
 	return ret;
 }
 
+static ssize_t queue_rq_cache_show(struct request_queue *q, char *page)
+{
+	return queue_var_show(q->rq_cache_sz, page);
+}
+
+static ssize_t
+queue_rq_cache_store(struct request_queue *q, const char *page, size_t count)
+{
+	unsigned long *rq_cache_map = NULL;
+	struct request *rq_cache = NULL;
+	unsigned long val;
+	ssize_t ret;
+
+	/*
+	 * alloc cache up front
+	 */
+	ret = queue_var_store(&val, page, count);
+	if (val) {
+		unsigned int map_sz;
+
+		if (val > q->nr_requests)
+			val = q->nr_requests;
+
+		rq_cache = kcalloc(val, sizeof(*rq_cache), GFP_KERNEL);
+		if (!rq_cache)
+			return -ENOMEM;
+
+		map_sz = (val + BITS_PER_LONG - 1) / BITS_PER_LONG;
+		rq_cache_map = kzalloc(map_sz, GFP_KERNEL);
+		if (!rq_cache_map) {
+			kfree(rq_cache);
+			return -ENOMEM;
+		}
+	}
+
+	spin_lock_irq(q->queue_lock);
+	elv_quiesce_start(q);
+
+	/*
+	 * free existing rqcache
+	 */
+	if (q->rq_cache_sz) {
+		kfree(q->rq_cache);
+		kfree(q->rq_cache_map);
+		q->rq_cache = NULL;
+		q->rq_cache_map = NULL;
+		q->rq_cache_sz = 0;
+	}
+
+	if (val) {
+		memset(rq_cache, 0, val * sizeof(struct request));
+		q->rq_cache = rq_cache;
+		q->rq_cache_map = rq_cache_map;
+		q->rq_cache_sz = val;
+		q->rq_cache_last = -1;
+	}
+
+	elv_quiesce_end(q);
+	spin_unlock_irq(q->queue_lock);
+	return ret;
+}
+
 static struct queue_sysfs_entry queue_requests_entry = {
 	.attr = {.name = "nr_requests", .mode = S_IRUGO | S_IWUSR },
 	.show = queue_requests_show,
@@ -347,6 +409,12 @@ static struct queue_sysfs_entry queue_iostats_entry = {
 	.store = queue_iostats_store,
 };
 
+static struct queue_sysfs_entry queue_rqcache_entry = {
+	.attr = {.name = "rq_cache", .mode = S_IRUGO | S_IWUSR },
+	.show = queue_rq_cache_show,
+	.store = queue_rq_cache_store,
+};
+
 static struct attribute *default_attrs[] = {
 	&queue_requests_entry.attr,
 	&queue_ra_entry.attr,
@@ -365,6 +433,7 @@ static struct attribute *default_attrs[] = {
 	&queue_nomerges_entry.attr,
 	&queue_rq_affinity_entry.attr,
 	&queue_iostats_entry.attr,
+	&queue_rqcache_entry.attr,
 	NULL,
 };
 
@@ -440,6 +509,11 @@ static void blk_release_queue(struct kobject *kobj)
 
 	if (q->queue_tags)
 		__blk_queue_free_tags(q);
+
+	if (q->rq_cache) {
+		kfree(q->rq_cache);
+		kfree(q->rq_cache_map);
+	}
 
 	blk_trace_shutdown(q);
 

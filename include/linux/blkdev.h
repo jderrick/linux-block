@@ -442,6 +442,13 @@ struct request_queue
 #if defined(CONFIG_BLK_DEV_BSG)
 	struct bsg_class_device bsg_dev;
 #endif
+	/*
+	 * Request pre-alloc handling
+	 */
+	struct request *rq_cache;
+	unsigned int rq_cache_sz;
+	unsigned int rq_cache_last;
+	unsigned long *rq_cache_map;
 };
 
 #define QUEUE_FLAG_CLUSTER	0	/* cluster several segments into 1 */
