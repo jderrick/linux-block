@@ -333,6 +333,7 @@ struct request_queue
 	struct list_head	queue_head;
 	struct request		*last_merge;
 	struct elevator_queue	*elevator;
+	struct elevator_ops	elv_ops;
 
 	/*
 	 * the queue request freelist, one for reads and one for writes
