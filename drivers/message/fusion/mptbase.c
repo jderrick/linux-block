@@ -114,6 +114,9 @@ module_param_call(mpt_fwfault_debug, param_set_int, param_get_int,
 MODULE_PARM_DESC(mpt_fwfault_debug, "Enable detection of Firmware fault"
 	" and halt Firmware on fault - (default=0)");
 
+static int mpt_iopoll_w = 32;
+module_param(mpt_iopoll_w, int, 0);
+MODULE_PARM_DESC(mpt_iopoll_w, " blk iopoll budget (default=32");
 
 
 #ifdef MFCNT
@@ -515,6 +518,44 @@ mpt_reply(MPT_ADAPTER *ioc, u32 pa)
 	mb();
 }
 
+static void mpt_irq_disable(MPT_ADAPTER *ioc)
+{
+	CHIPREG_WRITE32(&ioc->chip->IntMask, 0xFFFFFFFF);
+	CHIPREG_WRITE32(&ioc->chip->IntStatus, 0);
+	CHIPREG_READ32(&ioc->chip->IntStatus);
+}
+
+static void mpt_irq_enable(MPT_ADAPTER *ioc)
+{
+	CHIPREG_WRITE32(&ioc->chip->IntMask, MPI_HIM_DIM);
+}
+
+static inline void __mpt_handle_irq(MPT_ADAPTER *ioc, u32 pa)
+{
+	if (pa & MPI_ADDRESS_REPLY_A_BIT)
+		mpt_reply(ioc, pa);
+	else
+		mpt_turbo_reply(ioc, pa);
+}
+
+static int mpt_handle_irq(MPT_ADAPTER *ioc, unsigned int budget)
+{
+	int nr = 0;
+	u32 pa;
+
+	/*
+	 *  Drain the reply FIFO!
+	 */
+	while ((pa = CHIPREG_READ32_dmasync(&ioc->chip->ReplyFifo)) != 0xffffffff) {
+		nr++;
+		__mpt_handle_irq(ioc, pa);
+		if (nr == budget)
+			break;
+	}
+
+	return nr;
+}
+
 /*=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=*/
 /**
  *	mpt_interrupt - MPT adapter (IOC) specific interrupt handler.
@@ -536,23 +577,48 @@ static irqreturn_t
 mpt_interrupt(int irq, void *bus_id)
 {
 	MPT_ADAPTER *ioc = bus_id;
-	u32 pa = CHIPREG_READ32_dmasync(&ioc->chip->ReplyFifo);
+	int nr = 0;
 
-	if (pa == 0xFFFFFFFF)
-		return IRQ_NONE;
+	if (!blk_iopoll_enabled)
+		nr = mpt_handle_irq(ioc, -1U);
+	else if (blk_iopoll_sched_prep(&ioc->iopoll)) {
+		mpt_irq_disable(ioc);
+		ioc->iopoll.data =CHIPREG_READ32_dmasync(&ioc->chip->ReplyFifo);
+		blk_iopoll_sched(&ioc->iopoll);
+		nr = 1;
+	} else {
+		/*
+		 * Not really handled, but it will be by iopoll.
+		 */
+		nr = 1;
+	}
 
-	/*
-	 *  Drain the reply FIFO!
-	 */
-	do {
-		if (pa & MPI_ADDRESS_REPLY_A_BIT)
-			mpt_reply(ioc, pa);
-		else
-			mpt_turbo_reply(ioc, pa);
-		pa = CHIPREG_READ32_dmasync(&ioc->chip->ReplyFifo);
-	} while (pa != 0xFFFFFFFF);
+	if (nr)
+		return IRQ_HANDLED;
 
-	return IRQ_HANDLED;
+	return IRQ_NONE;
+}
+
+static int mpt_iopoll(struct blk_iopoll *iop, int budget)
+{
+	MPT_ADAPTER *ioc = container_of(iop, MPT_ADAPTER, iopoll);
+	int ret = 0;
+	u32 pa;
+
+	pa = iop->data;
+	iop->data = 0xffffffff;
+	if (pa != 0xffffffff) {
+		__mpt_handle_irq(ioc, pa);
+		ret = 1;
+	}
+
+	ret += mpt_handle_irq(ioc, budget - ret);
+	if (ret < budget) {
+		blk_iopoll_complete(iop);
+		mpt_irq_enable(ioc);
+	}
+
+	return ret;
 }
 
 /*=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=*/
@@ -2087,6 +2153,7 @@ mpt_suspend(struct pci_dev *pdev, pm_message_t state)
 	/* Clear any lingering interrupt */
 	CHIPREG_WRITE32(&ioc->chip->IntStatus, 0);
 
+	blk_iopoll_disable(&ioc->iopoll);
 	free_irq(ioc->pci_irq, ioc);
 	if (ioc->msi_enable)
 		pci_disable_msi(ioc->pcidev);
@@ -2352,6 +2419,8 @@ mpt_do_ioc_recovery(MPT_ADAPTER *ioc, u32 reason, int sleepFlag)
 				ret = -EBUSY;
 				goto out;
 			}
+			blk_iopoll_init(&ioc->iopoll, mpt_iopoll_w, mpt_iopoll);
+			blk_iopoll_enable(&ioc->iopoll);
 			irq_allocated = 1;
 			ioc->pci_irq = ioc->pcidev->irq;
 			pci_set_master(ioc->pcidev);		/* ?? */
@@ -2544,6 +2613,7 @@ mpt_do_ioc_recovery(MPT_ADAPTER *ioc, u32 reason, int sleepFlag)
 
  out:
 	if ((ret != 0) && irq_allocated) {
+		blk_iopoll_disable(&ioc->iopoll);
 		free_irq(ioc->pci_irq, ioc);
 		if (ioc->msi_enable)
 			pci_disable_msi(ioc->pcidev);
@@ -2752,6 +2822,7 @@ mpt_adapter_dispose(MPT_ADAPTER *ioc)
 	mpt_adapter_disable(ioc);
 
 	if (ioc->pci_irq != -1) {
+		blk_iopoll_disable(&ioc->iopoll);
 		free_irq(ioc->pci_irq, ioc);
 		if (ioc->msi_enable)
 			pci_disable_msi(ioc->pcidev);
