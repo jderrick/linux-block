@@ -75,6 +75,7 @@ struct scsi_cmnd {
 
 	int retries;
 	int allowed;
+	int unlocked;
 
 	unsigned char prot_op;
 	unsigned char prot_type;

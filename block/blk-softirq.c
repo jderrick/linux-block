@@ -101,7 +101,7 @@ static struct notifier_block __cpuinitdata blk_cpu_notifier = {
 	.notifier_call	= blk_cpu_notify,
 };
 
-void __blk_complete_request(struct request *req)
+void __blk_complete_request(struct request *req, int locked)
 {
 	struct request_queue *q = req->q;
 	unsigned long flags;
@@ -133,8 +133,15 @@ do_local:
 		 * entries there, someone already raised the irq but it
 		 * hasn't run yet.
 		 */
-		if (list->next == &req->csd.list)
-			raise_softirq_irqoff(BLOCK_SOFTIRQ);
+		if (list->next == &req->csd.list) {
+			if (locked)
+				raise_softirq_irqoff(BLOCK_SOFTIRQ);
+			else {
+				local_irq_restore(flags);
+				q->softirq_done_fn(req);
+				return;
+			}
+		}
 	} else if (raise_blk_irq(ccpu, req))
 		goto do_local;
 
@@ -157,9 +164,18 @@ void blk_complete_request(struct request *req)
 	if (unlikely(blk_should_fake_timeout(req->q)))
 		return;
 	if (!blk_mark_rq_complete(req))
-		__blk_complete_request(req);
+		__blk_complete_request(req, 1);
 }
 EXPORT_SYMBOL(blk_complete_request);
+
+void blk_complete_request_nolock(struct request *req)
+{
+	if (unlikely(blk_should_fake_timeout(req->q)))
+		return;
+	if (!blk_mark_rq_complete(req))
+		__blk_complete_request(req, 0);
+}
+EXPORT_SYMBOL(blk_complete_request_nolock);
 
 static __init int blk_softirq_init(void)
 {

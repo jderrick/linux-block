@@ -757,7 +757,10 @@ int scsi_dispatch_cmd(struct scsi_cmnd *cmd)
  */
 static void scsi_done(struct scsi_cmnd *cmd)
 {
-	blk_complete_request(cmd->request);
+	if (cmd->unlocked)
+		blk_complete_request_nolock(cmd->request);
+	else
+		blk_complete_request(cmd->request);
 }
 
 /* Move this to a header if it becomes more generally useful */

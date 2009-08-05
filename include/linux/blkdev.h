@@ -921,7 +921,7 @@ extern bool __blk_end_request_cur(struct request *rq, int error);
 extern bool __blk_end_request_err(struct request *rq, int error);
 
 extern void blk_complete_request(struct request *);
-extern void __blk_complete_request(struct request *);
+extern void blk_complete_request_nolock(struct request *);
 extern void blk_abort_request(struct request *);
 extern void blk_abort_queue(struct request_queue *);
 

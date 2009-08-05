@@ -2616,6 +2616,7 @@ static void atapi_qc_complete(struct ata_queued_cmd *qc)
 		cmd->result = SAM_STAT_GOOD;
 	}
 
+	cmd->unlocked = 1;
 	qc->scsidone(cmd);
 	ata_qc_free(qc);
 }
