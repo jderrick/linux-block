@@ -1,6 +1,8 @@
 #ifndef BLK_INTERNAL_H
 #define BLK_INTERNAL_H
 
+#include "elevator.h"
+
 /* Amount of time in which a process may batch requests */
 #define BLK_BATCH_TIME	(HZ/50UL)
 
@@ -62,7 +64,7 @@ static inline struct request *__elv_next_request(struct request_queue *q)
 				return rq;
 		}
 
-		if (!q->elv_ops.elevator_dispatch_fn(q, 0))
+		if (!elv_call_dispatch_fn(q, 0))
 			return NULL;
 	}
 }
@@ -70,13 +72,13 @@ static inline struct request *__elv_next_request(struct request_queue *q)
 static inline void elv_activate_rq(struct request_queue *q, struct request *rq)
 {
 	if (q->elv_ops.elevator_activate_req_fn)
-		q->elv_ops.elevator_activate_req_fn(q, rq);
+		elv_call_activate_req_fn(q, rq);
 }
 
 static inline void elv_deactivate_rq(struct request_queue *q, struct request *rq)
 {
 	if (q->elv_ops.elevator_deactivate_req_fn)
-		q->elv_ops.elevator_deactivate_req_fn(q, rq);
+		elv_call_deactivate_req_fn(q, rq);
 }
 
 #ifdef CONFIG_FAIL_IO_TIMEOUT

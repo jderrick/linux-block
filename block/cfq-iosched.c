@@ -15,6 +15,8 @@
 #include <linux/blktrace_api.h>
 #include "blk-cgroup.h"
 
+#include "cfq-iosched.h"
+
 /*
  * tunables
  */
@@ -462,7 +464,7 @@ static inline void cfq_schedule_dispatch(struct cfq_data *cfqd)
 	}
 }
 
-static int cfq_queue_empty(struct request_queue *q)
+int cfq_queue_empty(struct request_queue *q)
 {
 	struct cfq_data *cfqd = q->elevator->elevator_data;
 
@@ -1425,7 +1427,7 @@ cfq_find_rq_fmerge(struct cfq_data *cfqd, struct bio *bio)
 	return NULL;
 }
 
-static void cfq_activate_request(struct request_queue *q, struct request *rq)
+void cfq_activate_request(struct request_queue *q, struct request *rq)
 {
 	struct cfq_data *cfqd = q->elevator->elevator_data;
 
@@ -1436,7 +1438,7 @@ static void cfq_activate_request(struct request_queue *q, struct request *rq)
 	cfqd->last_position = blk_rq_pos(rq) + blk_rq_sectors(rq);
 }
 
-static void cfq_deactivate_request(struct request_queue *q, struct request *rq)
+void cfq_deactivate_request(struct request_queue *q, struct request *rq)
 {
 	struct cfq_data *cfqd = q->elevator->elevator_data;
 	const int sync = rq_is_sync(rq);
@@ -1464,8 +1466,7 @@ static void cfq_remove_request(struct request *rq)
 	}
 }
 
-static int cfq_merge(struct request_queue *q, struct request **req,
-		     struct bio *bio)
+int cfq_merge(struct request_queue *q, struct request **req, struct bio *bio)
 {
 	struct cfq_data *cfqd = q->elevator->elevator_data;
 	struct request *__rq;
@@ -1479,8 +1480,7 @@ static int cfq_merge(struct request_queue *q, struct request **req,
 	return ELEVATOR_NO_MERGE;
 }
 
-static void cfq_merged_request(struct request_queue *q, struct request *req,
-			       int type)
+void cfq_merged_request(struct request_queue *q, struct request *req, int type)
 {
 	if (type == ELEVATOR_FRONT_MERGE) {
 		struct cfq_queue *cfqq = RQ_CFQQ(req);
@@ -1489,9 +1489,8 @@ static void cfq_merged_request(struct request_queue *q, struct request *req,
 	}
 }
 
-static void
-cfq_merged_requests(struct request_queue *q, struct request *rq,
-		    struct request *next)
+void cfq_merged_requests(struct request_queue *q, struct request *rq,
+			 struct request *next)
 {
 	struct cfq_queue *cfqq = RQ_CFQQ(rq);
 	/*
@@ -1508,8 +1507,8 @@ cfq_merged_requests(struct request_queue *q, struct request *rq,
 	cfq_remove_request(next);
 }
 
-static int cfq_allow_merge(struct request_queue *q, struct request *rq,
-			   struct bio *bio)
+int cfq_allow_merge(struct request_queue *q, struct request *rq,
+		    struct bio *bio)
 {
 	struct cfq_data *cfqd = q->elevator->elevator_data;
 	struct cfq_io_context *cic;
@@ -2319,7 +2318,7 @@ static bool cfq_dispatch_request(struct cfq_data *cfqd, struct cfq_queue *cfqq)
  * Find the cfqq that we need to service and move a request from that to the
  * dispatch list
  */
-static int cfq_dispatch_requests(struct request_queue *q, int force)
+int cfq_dispatch_requests(struct request_queue *q, int force)
 {
 	struct cfq_data *cfqd = q->elevator->elevator_data;
 	struct cfq_queue *cfqq;
@@ -3199,7 +3198,7 @@ cfq_rq_enqueued(struct cfq_data *cfqd, struct cfq_queue *cfqq,
 	}
 }
 
-static void cfq_insert_request(struct request_queue *q, struct request *rq)
+void cfq_insert_request(struct request_queue *q, struct request *rq)
 {
 	struct cfq_data *cfqd = q->elevator->elevator_data;
 	struct cfq_queue *cfqq = RQ_CFQQ(rq);
@@ -3251,7 +3250,7 @@ static void cfq_update_hw_tag(struct cfq_data *cfqd)
 		cfqd->hw_tag = 0;
 }
 
-static void cfq_completed_request(struct request_queue *q, struct request *rq)
+void cfq_completed_request(struct request_queue *q, struct request *rq)
 {
 	struct cfq_queue *cfqq = RQ_CFQQ(rq);
 	struct cfq_data *cfqd = cfqq->cfqd;
@@ -3361,7 +3360,7 @@ static inline int __cfq_may_queue(struct cfq_queue *cfqq)
 	return ELV_MQUEUE_MAY;
 }
 
-static int cfq_may_queue(struct request_queue *q, int rw)
+int cfq_may_queue(struct request_queue *q, int rw)
 {
 	struct cfq_data *cfqd = q->elevator->elevator_data;
 	struct task_struct *tsk = current;
@@ -3392,7 +3391,7 @@ static int cfq_may_queue(struct request_queue *q, int rw)
 /*
  * queue lock held here
  */
-static void cfq_put_request(struct request *rq)
+void cfq_put_request(struct request *rq)
 {
 	struct cfq_queue *cfqq = RQ_CFQQ(rq);
 
@@ -3451,8 +3450,7 @@ split_cfqq(struct cfq_io_context *cic, struct cfq_queue *cfqq)
 /*
  * Allocate cfq data structures associated with this request.
  */
-static int
-cfq_set_request(struct request_queue *q, struct request *rq, gfp_t gfp_mask)
+int cfq_set_request(struct request_queue *q, struct request *rq, gfp_t gfp_mask)
 {
 	struct cfq_data *cfqd = q->elevator->elevator_data;
 	struct cfq_io_context *cic;

@@ -49,6 +49,10 @@ config DEBUG_CFQ_IOSCHED
 	  Enable CFQ IO scheduling debugging in CFQ. Currently it makes
 	  blktrace output more verbose.
 
+config IOSCHED_CFQ_BUILTIN
+	bool
+	default y if IOSCHED_CFQ=y
+
 choice
 	prompt "Default I/O scheduler"
 	default DEFAULT_CFQ
