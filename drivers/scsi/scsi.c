@@ -133,7 +133,6 @@ EXPORT_SYMBOL(scsi_device_type);
 
 struct scsi_host_cmd_pool {
 	struct kmem_cache	*cmd_slab;
-	struct kmem_cache	*sense_slab;
 	unsigned int		users;
 	char			*cmd_name;
 	char			*sense_name;
@@ -167,20 +166,9 @@ static DEFINE_MUTEX(host_cmd_pool_mutex);
 static struct scsi_cmnd *
 scsi_pool_alloc_command(struct scsi_host_cmd_pool *pool, gfp_t gfp_mask)
 {
-	struct scsi_cmnd *cmd;
+	gfp_t gfp = gfp_mask | pool->gfp_mask;
 
-	cmd = kmem_cache_zalloc(pool->cmd_slab, gfp_mask | pool->gfp_mask);
-	if (!cmd)
-		return NULL;
-
-	cmd->sense_buffer = kmem_cache_alloc(pool->sense_slab,
-					     gfp_mask | pool->gfp_mask);
-	if (!cmd->sense_buffer) {
-		kmem_cache_free(pool->cmd_slab, cmd);
-		return NULL;
-	}
-
-	return cmd;
+	return kmem_cache_zalloc(pool->cmd_slab, gfp);
 }
 
 /**
@@ -198,7 +186,6 @@ scsi_pool_free_command(struct scsi_host_cmd_pool *pool,
 	if (cmd->prot_sdb)
 		kmem_cache_free(scsi_sdb_cache, cmd->prot_sdb);
 
-	kmem_cache_free(pool->sense_slab, cmd->sense_buffer);
 	kmem_cache_free(pool->cmd_slab, cmd);
 }
 
@@ -255,14 +242,10 @@ struct scsi_cmnd *__scsi_get_command(struct Scsi_Host *shost, gfp_t gfp_mask)
 		spin_unlock_irqrestore(&shost->free_list_lock, flags);
 
 		if (cmd) {
-			void *buf, *prot;
+			void *prot;
 
-			buf = cmd->sense_buffer;
 			prot = cmd->prot_sdb;
-
 			memset(cmd, 0, sizeof(*cmd));
-
-			cmd->sense_buffer = buf;
 			cmd->prot_sdb = prot;
 		}
 	}
@@ -364,19 +347,13 @@ static struct scsi_host_cmd_pool *scsi_get_host_cmd_pool(gfp_t gfp_mask)
 	pool = (gfp_mask & __GFP_DMA) ? &scsi_cmd_dma_pool :
 		&scsi_cmd_pool;
 	if (!pool->users) {
-		pool->cmd_slab = kmem_cache_create(pool->cmd_name,
-						   sizeof(struct scsi_cmnd), 0,
-						   pool->slab_flags, NULL);
+		unsigned int slab_size;
+
+		slab_size = sizeof(struct scsi_cmnd) + SCSI_SENSE_BUFFERSIZE;
+		pool->cmd_slab = kmem_cache_create(pool->cmd_name, slab_size,
+						   0, pool->slab_flags, NULL);
 		if (!pool->cmd_slab)
 			goto fail;
-
-		pool->sense_slab = kmem_cache_create(pool->sense_name,
-						     SCSI_SENSE_BUFFERSIZE, 0,
-						     pool->slab_flags, NULL);
-		if (!pool->sense_slab) {
-			kmem_cache_destroy(pool->cmd_slab);
-			goto fail;
-		}
 	}
 
 	pool->users++;
@@ -400,10 +377,9 @@ static void scsi_put_host_cmd_pool(gfp_t gfp_mask)
 	 */
 	BUG_ON(pool->users == 0);
 
-	if (!--pool->users) {
+	if (!--pool->users)
 		kmem_cache_destroy(pool->cmd_slab);
-		kmem_cache_destroy(pool->sense_slab);
-	}
+
 	mutex_unlock(&host_cmd_pool_mutex);
 }
 

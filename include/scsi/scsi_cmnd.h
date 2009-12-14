@@ -102,12 +102,6 @@ struct scsi_cmnd {
 	struct request *request;	/* The command we are
 				   	   working on */
 
-#define SCSI_SENSE_BUFFERSIZE 	96
-	unsigned char *sense_buffer;
-				/* obtained by REQUEST SENSE when
-				 * CHECK CONDITION is received on original
-				 * command (auto-sense) */
-
 	/* Low-level done function - can be used by low-level driver to point
 	 *        to completion function.  Not used by mid/upper level code. */
 	void (*scsi_done) (struct scsi_cmnd *);
@@ -129,6 +123,12 @@ struct scsi_cmnd {
 	int result;		/* Status code from lower level driver */
 
 	unsigned char tag;	/* SCSI-II queued command tag */
+
+#define SCSI_SENSE_BUFFERSIZE 	96
+	unsigned char sense_buffer[0];
+				/* obtained by REQUEST SENSE when
+				 * CHECK CONDITION is received on original
+				 * command (auto-sense) */
 };
 
 extern struct scsi_cmnd *scsi_get_command(struct scsi_device *, gfp_t);
