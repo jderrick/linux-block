@@ -217,6 +217,7 @@ static void blk_delay_work(struct work_struct *work)
 	spin_lock_irq(q->queue_lock);
 	__blk_run_queue(q);
 	spin_unlock_irq(q->queue_lock);
+	blk_put_queue(q);
 }
 
 /**
@@ -229,9 +230,14 @@ static void blk_delay_work(struct work_struct *work)
  *   resources to come back. This function will make sure that queueing is
  *   restarted around the specified time.
  */
-void blk_delay_queue(struct request_queue *q, unsigned long msecs)
+int blk_delay_queue(struct request_queue *q, unsigned long msecs)
 {
-	schedule_delayed_work(&q->delay_work, msecs_to_jiffies(msecs));
+	if (!blk_get_queue(q)) {
+		schedule_delayed_work(&q->delay_work, msecs_to_jiffies(msecs));
+		return 0;
+	}
+
+	return 1;
 }
 EXPORT_SYMBOL(blk_delay_queue);
 
