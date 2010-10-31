@@ -2313,7 +2313,6 @@ const struct address_space_operations cifs_addr_ops = {
 	.set_page_dirty = __set_page_dirty_nobuffers,
 	.releasepage = cifs_release_page,
 	.invalidatepage = cifs_invalidate_page,
-	/* .sync_page = cifs_sync_page, */
 	/* .direct_IO = */
 };
 
@@ -2331,6 +2330,5 @@ const struct address_space_operations cifs_addr_ops_smallbuf = {
 	.set_page_dirty = __set_page_dirty_nobuffers,
 	.releasepage = cifs_release_page,
 	.invalidatepage = cifs_invalidate_page,
-	/* .sync_page = cifs_sync_page, */
 	/* .direct_IO = */
 };

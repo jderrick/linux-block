@@ -203,15 +203,6 @@ static struct page *drbd_pp_first_pages_or_try_alloc(struct drbd_conf *mdev, int
 	return NULL;
 }
 
-/* kick lower level device, if we have more than (arbitrary number)
- * reference counts on it, which typically are locally submitted io
- * requests.  don't use unacked_cnt, so we speed up proto A and B, too. */
-static void maybe_kick_lo(struct drbd_conf *mdev)
-{
-	if (atomic_read(&mdev->local_cnt) >= mdev->net_conf->unplug_watermark)
-		drbd_kick_lo(mdev);
-}
-
 static void reclaim_net_ee(struct drbd_conf *mdev, struct list_head *to_be_freed)
 {
 	struct drbd_epoch_entry *e;
@@ -235,7 +226,6 @@ static void drbd_kick_lo_and_reclaim_net(struct drbd_conf *mdev)
 	LIST_HEAD(reclaimed);
 	struct drbd_epoch_entry *e, *t;
 
-	maybe_kick_lo(mdev);
 	spin_lock_irq(&mdev->req_lock);
 	reclaim_net_ee(mdev, &reclaimed);
 	spin_unlock_irq(&mdev->req_lock);
@@ -452,8 +442,7 @@ void _drbd_wait_ee_list_empty(struct drbd_conf *mdev, struct list_head *head)
 	while (!list_empty(head)) {
 		prepare_to_wait(&mdev->ee_wait, &wait, TASK_UNINTERRUPTIBLE);
 		spin_unlock_irq(&mdev->req_lock);
-		drbd_kick_lo(mdev);
-		schedule();
+		io_schedule();
 		finish_wait(&mdev->ee_wait, &wait);
 		spin_lock_irq(&mdev->req_lock);
 	}
@@ -1232,7 +1221,6 @@ next_bio:
 		if (bios && bios->bi_next)
 			bios->bi_rw &= ~REQ_HARDBARRIER;
 	} while (bios);
-	maybe_kick_lo(mdev);
 	return 0;
 
 fail:
@@ -1287,9 +1275,6 @@ static int receive_Barrier(struct drbd_conf *mdev, enum drbd_packets cmd, unsign
 	struct drbd_epoch *epoch;
 
 	inc_unacked(mdev);
-
-	if (mdev->net_conf->wire_protocol != DRBD_PROT_C)
-		drbd_kick_lo(mdev);
 
 	mdev->current_epoch->barrier_nr = p->barrier;
 	rv = drbd_may_finish_epoch(mdev, mdev->current_epoch, EV_GOT_BARRIER_NR);

@@ -193,6 +193,22 @@ void blk_dump_rq_flags(struct request *rq, char *msg)
 }
 EXPORT_SYMBOL(blk_dump_rq_flags);
 
+/*
+ * Make sure that plugs that were pending when this function was entered,
+ * are now complete and requests pushed to the queue.
+*/
+static inline void queue_sync_plugs(struct request_queue *q)
+{
+	/*
+	 * If the current process is plugged and has barriers submitted,
+	 * we will livelock if we don't unplug first.
+	 */
+	blk_flush_plug(current);
+#if 0
+	synchronize_qrcu(&q->qrcu);
+#endif
+}
+
 static void blk_delay_work(struct work_struct *work)
 {
 	struct request_queue *q;
@@ -218,137 +234,6 @@ void blk_delay_queue(struct request_queue *q, unsigned long msecs)
 	schedule_delayed_work(&q->delay_work, msecs_to_jiffies(msecs));
 }
 EXPORT_SYMBOL(blk_delay_queue);
-
-/*
- * "plug" the device if there are no outstanding requests: this will
- * force the transfer to start only after we have put all the requests
- * on the list.
- *
- * This is called with interrupts off and no requests on the queue and
- * with the queue lock held.
- */
-void blk_plug_device(struct request_queue *q)
-{
-	WARN_ON(!irqs_disabled());
-
-	/*
-	 * don't plug a stopped queue, it must be paired with blk_start_queue()
-	 * which will restart the queueing
-	 */
-	if (blk_queue_stopped(q))
-		return;
-
-	if (!queue_flag_test_and_set(QUEUE_FLAG_PLUGGED, q)) {
-		mod_timer(&q->unplug_timer, jiffies + q->unplug_delay);
-		trace_block_plug(q);
-	}
-}
-EXPORT_SYMBOL(blk_plug_device);
-
-/**
- * blk_plug_device_unlocked - plug a device without queue lock held
- * @q:    The &struct request_queue to plug
- *
- * Description:
- *   Like @blk_plug_device(), but grabs the queue lock and disables
- *   interrupts.
- **/
-void blk_plug_device_unlocked(struct request_queue *q)
-{
-	unsigned long flags;
-
-	spin_lock_irqsave(q->queue_lock, flags);
-	blk_plug_device(q);
-	spin_unlock_irqrestore(q->queue_lock, flags);
-}
-EXPORT_SYMBOL(blk_plug_device_unlocked);
-
-/*
- * remove the queue from the plugged list, if present. called with
- * queue lock held and interrupts disabled.
- */
-int blk_remove_plug(struct request_queue *q)
-{
-	WARN_ON(!irqs_disabled());
-
-	if (!queue_flag_test_and_clear(QUEUE_FLAG_PLUGGED, q))
-		return 0;
-
-	del_timer(&q->unplug_timer);
-	return 1;
-}
-EXPORT_SYMBOL(blk_remove_plug);
-
-/*
- * remove the plug and let it rip..
- */
-void __generic_unplug_device(struct request_queue *q)
-{
-	if (unlikely(blk_queue_stopped(q)))
-		return;
-	if (!blk_remove_plug(q) && !blk_queue_nonrot(q))
-		return;
-
-	q->request_fn(q);
-}
-
-/**
- * generic_unplug_device - fire a request queue
- * @q:    The &struct request_queue in question
- *
- * Description:
- *   Linux uses plugging to build bigger requests queues before letting
- *   the device have at them. If a queue is plugged, the I/O scheduler
- *   is still adding and merging requests on the queue. Once the queue
- *   gets unplugged, the request_fn defined for the queue is invoked and
- *   transfers started.
- **/
-void generic_unplug_device(struct request_queue *q)
-{
-	if (blk_queue_plugged(q)) {
-		spin_lock_irq(q->queue_lock);
-		__generic_unplug_device(q);
-		spin_unlock_irq(q->queue_lock);
-	}
-}
-EXPORT_SYMBOL(generic_unplug_device);
-
-static void blk_backing_dev_unplug(struct backing_dev_info *bdi,
-				   struct page *page)
-{
-	struct request_queue *q = bdi->unplug_io_data;
-
-	blk_unplug(q);
-}
-
-void blk_unplug_work(struct work_struct *work)
-{
-	struct request_queue *q =
-		container_of(work, struct request_queue, unplug_work);
-
-	trace_block_unplug_io(q);
-	q->unplug_fn(q);
-}
-
-void blk_unplug_timeout(unsigned long data)
-{
-	struct request_queue *q = (struct request_queue *)data;
-
-	trace_block_unplug_timer(q);
-	kblockd_schedule_work(q, &q->unplug_work);
-}
-
-void blk_unplug(struct request_queue *q)
-{
-	/*
-	 * devices don't necessarily have an ->unplug_fn defined
-	 */
-	if (q->unplug_fn) {
-		trace_block_unplug_io(q);
-		q->unplug_fn(q);
-	}
-}
-EXPORT_SYMBOL(blk_unplug);
 
 /**
  * blk_start_queue - restart a previously stopped queue
@@ -384,7 +269,6 @@ EXPORT_SYMBOL(blk_start_queue);
  **/
 void blk_stop_queue(struct request_queue *q)
 {
-	blk_remove_plug(q);
 	cancel_delayed_work(&q->delay_work);
 	queue_flag_set(QUEUE_FLAG_STOPPED, q);
 }
@@ -406,11 +290,10 @@ EXPORT_SYMBOL(blk_stop_queue);
  */
 void blk_sync_queue(struct request_queue *q)
 {
-	del_timer_sync(&q->unplug_timer);
 	del_timer_sync(&q->timeout);
-	cancel_work_sync(&q->unplug_work);
 	throtl_shutdown_timer_wq(q);
 	cancel_delayed_work_sync(&q->delay_work);
+	queue_sync_plugs(q);
 }
 EXPORT_SYMBOL(blk_sync_queue);
 
@@ -425,12 +308,7 @@ EXPORT_SYMBOL(blk_sync_queue);
  */
 void __blk_run_queue(struct request_queue *q)
 {
-	blk_remove_plug(q);
-
 	if (unlikely(blk_queue_stopped(q)))
-		return;
-
-	if (elv_queue_empty(q))
 		return;
 
 	/*
@@ -440,10 +318,8 @@ void __blk_run_queue(struct request_queue *q)
 	if (!queue_flag_test_and_set(QUEUE_FLAG_REENTER, q)) {
 		q->request_fn(q);
 		queue_flag_clear(QUEUE_FLAG_REENTER, q);
-	} else {
-		queue_flag_set(QUEUE_FLAG_PLUGGED, q);
-		kblockd_schedule_work(q, &q->unplug_work);
-	}
+	} else
+		queue_delayed_work(kblockd_workqueue, &q->delay_work, 0);
 }
 EXPORT_SYMBOL(__blk_run_queue);
 
@@ -530,8 +406,6 @@ struct request_queue *blk_alloc_queue_node(gfp_t gfp_mask, int node_id)
 	if (!q)
 		return NULL;
 
-	q->backing_dev_info.unplug_io_fn = blk_backing_dev_unplug;
-	q->backing_dev_info.unplug_io_data = q;
 	q->backing_dev_info.ra_pages =
 			(VM_MAX_READAHEAD * 1024) / PAGE_CACHE_SIZE;
 	q->backing_dev_info.state = 0;
@@ -549,13 +423,18 @@ struct request_queue *blk_alloc_queue_node(gfp_t gfp_mask, int node_id)
 		return NULL;
 	}
 
+#if 0
+	if (init_qrcu_struct(&q->qrcu)) {
+		bdi_destroy(&q->backing_dev_info);
+		kmem_cache_free(blk_requestq_cachep, q);
+		return NULL;
+	}
+#endif
 	setup_timer(&q->backing_dev_info.laptop_mode_wb_timer,
 		    laptop_mode_timer_fn, (unsigned long) q);
-	init_timer(&q->unplug_timer);
 	setup_timer(&q->timeout, blk_rq_timed_out_timer, (unsigned long) q);
 	INIT_LIST_HEAD(&q->timeout_list);
 	INIT_LIST_HEAD(&q->pending_flushes);
-	INIT_WORK(&q->unplug_work, blk_unplug_work);
 	INIT_DELAYED_WORK(&q->delay_work, blk_delay_work);
 
 	kobject_init(&q->kobj, &blk_queue_ktype);
@@ -645,7 +524,6 @@ blk_init_allocated_queue_node(struct request_queue *q, request_fn_proc *rfn,
 	q->request_fn		= rfn;
 	q->prep_rq_fn		= NULL;
 	q->unprep_rq_fn		= NULL;
-	q->unplug_fn		= generic_unplug_device;
 	q->queue_flags		= QUEUE_FLAG_DEFAULT;
 	q->queue_lock		= lock;
 
@@ -882,8 +760,8 @@ out:
 }
 
 /*
- * No available requests for this queue, unplug the device and wait for some
- * requests to become available.
+ * No available requests for this queue, wait for some requests to become
+ * available.
  *
  * Called with q->queue_lock held, and returns with it unlocked.
  */
@@ -904,7 +782,6 @@ static struct request *get_request_wait(struct request_queue *q, int rw_flags,
 
 		trace_block_sleeprq(q, bio, rw_flags & 1);
 
-		__generic_unplug_device(q);
 		spin_unlock_irq(q->queue_lock);
 		io_schedule();
 
@@ -1030,7 +907,7 @@ static void add_acct_request(struct request_queue *q, struct request *rq,
 			     int where)
 {
 	drive_stat_acct(rq, 1);
-	__elv_add_request(q, rq, where, 0);
+	__elv_add_request(q, rq, where);
 }
 
 /**

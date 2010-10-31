@@ -950,10 +950,6 @@ allocate_barrier:
 			generic_make_request(req->private_bio);
 	}
 
-	/* we need to plug ALWAYS since we possibly need to kick lo_dev.
-	 * we plug after submit, so we won't miss an unplug event */
-	drbd_plug_device(mdev);
-
 	return 0;
 
 fail_conflicting:
