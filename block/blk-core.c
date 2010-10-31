@@ -2613,19 +2613,13 @@ static int plug_rq_cmp(void *priv, struct list_head *a, struct list_head *b)
 	return !(rqa->q == rqb->q);
 }
 
-/*
- * Must be called with interrupts disabled
- */
-void blk_finish_plug(struct blk_plug *plug)
+static void __blk_finish_plug(struct task_struct *tsk, struct blk_plug *plug)
 {
-	struct task_struct *tsk = current;
 	struct request_queue *q = NULL;
+	unsigned long flags;
 	struct request *rq;
 
-	WARN_ON(!irqs_disabled());
-
-	if (!plug)
-		return;
+	local_irq_save(flags);
 
 	if (!list_empty(&plug->list) && plug != tsk->plug)
 		BUG();
@@ -2658,13 +2652,23 @@ void blk_finish_plug(struct blk_plug *plug)
 		__blk_run_queue(q);
 		spin_unlock(q->queue_lock);
 	}
+
 	BUG_ON(!list_empty(&plug->list));
+	local_irq_restore(flags);
+}
+
+void blk_finish_plug(struct blk_plug *plug)
+{
+	if (plug)
+		__blk_finish_plug(current, plug);
 }
 
 void __blk_flush_plug(struct task_struct *tsk, struct blk_plug *plug)
 {
-	blk_finish_plug(plug);
+	preempt_disable();
+	__blk_finish_plug(tsk, plug);
 	tsk->plug = plug;
+	preempt_enable();
 }
 
 int __init blk_dev_init(void)
