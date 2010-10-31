@@ -3882,6 +3882,7 @@ need_resched:
 	release_kernel_lock(prev);
 need_resched_nonpreemptible:
 
+	BUG_ON(prev->plug && !list_empty(&prev->plug->list));
 	schedule_debug(prev);
 
 	if (sched_feat(HRTICK))
@@ -3908,6 +3909,7 @@ need_resched_nonpreemptible:
 				if (to_wakeup)
 					try_to_wake_up_local(to_wakeup);
 			}
+			blk_flush_plug(prev);
 			deactivate_task(rq, prev, DEQUEUE_SLEEP);
 		}
 		switch_count = &prev->nvcsw;
@@ -3920,6 +3922,7 @@ need_resched_nonpreemptible:
 
 	put_prev_task(rq, prev);
 	next = pick_next_task(rq);
+	BUG_ON(next->plug && !list_empty(&next->plug->list));
 
 	if (likely(prev != next)) {
 		sched_info_switch(prev, next);
@@ -5265,6 +5268,7 @@ void __sched io_schedule(void)
 
 	delayacct_blkio_start();
 	atomic_inc(&rq->nr_iowait);
+	blk_flush_plug(current);
 	current->in_iowait = 1;
 	schedule();
 	current->in_iowait = 0;
@@ -5280,6 +5284,7 @@ long __sched io_schedule_timeout(long timeout)
 
 	delayacct_blkio_start();
 	atomic_inc(&rq->nr_iowait);
+	blk_flush_plug(current);
 	current->in_iowait = 1;
 	ret = schedule_timeout(timeout);
 	current->in_iowait = 0;

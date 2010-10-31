@@ -100,6 +100,7 @@ struct robust_list_head;
 struct bio_list;
 struct fs_struct;
 struct perf_event_context;
+struct blk_plug;
 
 /*
  * List of flags we want to share for kernel threads,
@@ -1411,6 +1412,11 @@ struct task_struct {
 
 /* stacked block device info */
 	struct bio_list *bio_list;
+
+#ifdef CONFIG_BLOCK
+/* stack plugging */
+	struct blk_plug *plug;
+#endif
 
 /* VM state */
 	struct reclaim_state *reclaim_state;
