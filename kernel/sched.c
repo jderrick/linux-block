@@ -3947,6 +3947,8 @@ need_resched:
 
 	release_kernel_lock(prev);
 need_resched_nonpreemptible:
+	blk_flush_plug(prev);
+	BUG_ON(prev->plug && !list_empty(&prev->plug->list));
 
 	schedule_debug(prev);
 
@@ -3985,6 +3987,7 @@ need_resched_nonpreemptible:
 
 	put_prev_task(rq, prev);
 	next = pick_next_task(rq);
+	BUG_ON(next->plug && !list_empty(&next->plug->list));
 	clear_tsk_need_resched(prev);
 	rq->skip_clock_update = 0;
 
@@ -5332,6 +5335,7 @@ void __sched io_schedule(void)
 
 	delayacct_blkio_start();
 	atomic_inc(&rq->nr_iowait);
+	blk_flush_plug(current);
 	current->in_iowait = 1;
 	schedule();
 	current->in_iowait = 0;
@@ -5347,6 +5351,7 @@ long __sched io_schedule_timeout(long timeout)
 
 	delayacct_blkio_start();
 	atomic_inc(&rq->nr_iowait);
+	blk_flush_plug(current);
 	current->in_iowait = 1;
 	ret = schedule_timeout(timeout);
 	current->in_iowait = 0;
