@@ -433,7 +433,7 @@ static int has_failed(raid5_conf_t *conf)
 	return 0;
 }
 
-static void unplug_slaves(mddev_t *mddev);
+static void raid5_kick_dev(raid5_conf_t *conf);
 
 static struct stripe_head *
 get_active_stripe(raid5_conf_t *conf, sector_t sector,
@@ -463,8 +463,7 @@ get_active_stripe(raid5_conf_t *conf, sector_t sector,
 						     < (conf->max_nr_stripes *3/4)
 						     || !conf->inactive_blocked),
 						    conf->device_lock,
-						    md_raid5_unplug_device(conf)
-					);
+						   raid5_kick_dev(conf));
 				conf->inactive_blocked = 0;
 			} else
 				init_stripe(sh, sector, previous);
@@ -1473,8 +1472,7 @@ static int resize_stripes(raid5_conf_t *conf, int newsize)
 		wait_event_lock_irq(conf->wait_for_stripe,
 				    !list_empty(&conf->inactive_list),
 				    conf->device_lock,
-				    unplug_slaves(conf->mddev)
-			);
+				    blk_flush_plug(current));
 		osh = get_free_stripe(conf);
 		spin_unlock_irq(&conf->device_lock);
 		atomic_set(&nsh->count, 1);
@@ -3645,45 +3643,11 @@ static void activate_bit_delay(raid5_conf_t *conf)
 	}
 }
 
-static void unplug_slaves(mddev_t *mddev)
+static void raid5_kick_dev(raid5_conf_t *conf)
 {
-	raid5_conf_t *conf = mddev->private;
-	int i;
-	int devs = max(conf->raid_disks, conf->previous_raid_disks);
-
-	rcu_read_lock();
-	for (i = 0; i < devs; i++) {
-		mdk_rdev_t *rdev = rcu_dereference(conf->disks[i].rdev);
-		if (rdev && !test_bit(Faulty, &rdev->flags) && atomic_read(&rdev->nr_pending)) {
-			struct request_queue *r_queue = bdev_get_queue(rdev->bdev);
-
-			atomic_inc(&rdev->nr_pending);
-			rcu_read_unlock();
-
-			blk_unplug(r_queue);
-
-			rdev_dec_pending(rdev, mddev);
-			rcu_read_lock();
-		}
-	}
-	rcu_read_unlock();
-}
-
-void md_raid5_unplug_device(raid5_conf_t *conf)
-{
-	unsigned long flags;
-
-	spin_lock_irqsave(&conf->device_lock, flags);
-
-	if (plugger_remove_plug(&conf->plug)) {
-		conf->seq_flush++;
-		raid5_activate_delayed(conf);
-	}
+	blk_flush_plug(current);
+	raid5_activate_delayed(conf);
 	md_wakeup_thread(conf->mddev->thread);
-
-	spin_unlock_irqrestore(&conf->device_lock, flags);
-
-	unplug_slaves(conf->mddev);
 }
 EXPORT_SYMBOL_GPL(md_raid5_unplug_device);
 
@@ -3691,12 +3655,6 @@ static void raid5_unplug(struct plug_handle *plug)
 {
 	raid5_conf_t *conf = container_of(plug, raid5_conf_t, plug);
 	md_raid5_unplug_device(conf);
-}
-
-static void raid5_unplug_queue(struct request_queue *q)
-{
-	mddev_t *mddev = q->queuedata;
-	md_raid5_unplug_device(mddev->private);
 }
 
 int md_raid5_congested(mddev_t *mddev, int bits)
@@ -4100,7 +4058,7 @@ static int make_request(mddev_t *mddev, struct bio * bi)
 				 * add failed due to overlap.  Flush everything
 				 * and wait a while
 				 */
-				md_raid5_unplug_device(conf);
+				raid5_kick_dev(conf);
 				release_stripe(sh);
 				schedule();
 				goto retry;
@@ -4365,7 +4323,6 @@ static inline sector_t sync_request(mddev_t *mddev, sector_t sector_nr, int *ski
 
 	if (sector_nr >= max_sector) {
 		/* just being told to finish up .. nothing much to do */
-		unplug_slaves(mddev);
 
 		if (test_bit(MD_RECOVERY_RESHAPE, &mddev->recovery)) {
 			end_reshape(conf);
@@ -4569,7 +4526,6 @@ static void raid5d(mddev_t *mddev)
 	spin_unlock_irq(&conf->device_lock);
 
 	async_tx_issue_pending_all();
-	unplug_slaves(mddev);
 
 	pr_debug("--- raid5d inactive\n");
 }
@@ -5201,11 +5157,9 @@ static int run(mddev_t *mddev)
 			mddev->queue->backing_dev_info.ra_pages = 2 * stripe;
 
 		blk_queue_merge_bvec(mddev->queue, raid5_mergeable_bvec);
-
 		mddev->queue->backing_dev_info.congested_data = mddev;
 		mddev->queue->backing_dev_info.congested_fn = raid5_congested;
 		mddev->queue->queue_lock = &conf->device_lock;
-		mddev->queue->unplug_fn = raid5_unplug_queue;
 
 		chunk_size = mddev->chunk_sectors << 9;
 		blk_queue_io_min(mddev->queue, chunk_size);

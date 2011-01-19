@@ -59,7 +59,6 @@ static struct request *blk_flush_complete_seq(struct request_queue *q,
 static void blk_flush_complete_seq_end_io(struct request_queue *q,
 					  unsigned seq, int error)
 {
-	bool was_empty = elv_queue_empty(q);
 	struct request *next_rq;
 
 	next_rq = blk_flush_complete_seq(q, seq, error);
@@ -68,7 +67,7 @@ static void blk_flush_complete_seq_end_io(struct request_queue *q,
 	 * Moving a request silently to empty queue_head may stall the
 	 * queue.  Kick the queue in those cases.
 	 */
-	if (was_empty && next_rq)
+	if (next_rq)
 		__blk_run_queue(q);
 }
 
