@@ -232,7 +232,9 @@ static void blk_delay_work(struct work_struct *work)
 	spin_lock_irq(q->queue_lock);
 	__blk_run_queue(q);
 	spin_unlock_irq(q->queue_lock);
+#if 0
 	blk_put_queue(q);
+#endif
 }
 
 /**
@@ -247,12 +249,18 @@ static void blk_delay_work(struct work_struct *work)
  */
 int blk_delay_queue(struct request_queue *q, unsigned long msecs)
 {
+#if 0
 	if (!blk_get_queue(q)) {
 		schedule_delayed_work(&q->delay_work, msecs_to_jiffies(msecs));
 		return 0;
 	}
 
 	return 1;
+#else
+
+	schedule_delayed_work(&q->delay_work, msecs_to_jiffies(msecs));
+	return 0;
+#endif
 }
 EXPORT_SYMBOL(blk_delay_queue);
 
@@ -313,7 +321,7 @@ void blk_sync_queue(struct request_queue *q)
 {
 	del_timer_sync(&q->timeout);
 	throtl_shutdown_timer_wq(q);
-	cancel_delayed_work_sync(&q->delay_work);
+	cancel_delayed_work(&q->delay_work);
 	queue_sync_plugs(q);
 }
 EXPORT_SYMBOL(blk_sync_queue);
@@ -1300,9 +1308,8 @@ get_rq:
 				plug->should_sort = 1;
 		}
 		req->cmd_flags |= REQ_ON_PLUG;
-		preempt_disable();
 		list_add_tail(&req->queuelist, &plug->list);
-		preempt_enable();
+		drive_stat_acct(req, 1);
 	} else {
 		spin_lock_irq(q->queue_lock);
 		add_acct_request(q, req, where);
