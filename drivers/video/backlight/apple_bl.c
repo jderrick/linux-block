@@ -44,6 +44,12 @@ static const struct hw_data *hw_data;
 static int debug;
 module_param_named(debug, debug, int, 0644);
 MODULE_PARM_DESC(debug, "Set to one to enable debugging messages.");
+static int use_gmux;
+module_param_named(use_gmux, use_gmux, int, 0644);
+MODULE_PARM_DESC(use_gmux, "Set to one to use gmux backlight method");
+static int max_brightness = 132000;
+module_param_named(max_brightness, max_brightness, int, 0644);
+MODULE_PARM_DESC(max_brightness, "Set to max allowable brightness");
 
 /*
  * Implementation for machines with Intel chipset.
@@ -139,7 +145,49 @@ static const struct hw_data nvidia_chipset_data = {
 	.set_brightness = nvidia_chipset_set_brightness,
 };
 
-static int __devinit apple_bl_add(struct acpi_device *dev)
+#define PORT_BACKLIGHT_1 0x774
+
+static void gmux_set_brightness(int intensity)
+{
+	outl(intensity, PORT_BACKLIGHT_1);
+}
+
+static int gmux_send_intensity(struct backlight_device *bd)
+{
+	int intensity = bd->props.brightness;
+
+	if (debug)
+		printk(KERN_DEBUG DRIVER "setting brightness to %d\n",
+		       intensity);
+
+	gmux_set_brightness(intensity);
+	return 0;
+}
+
+static int gmux_get_intensity(struct backlight_device *bd)
+{
+	int intensity;
+	intensity = inl(PORT_BACKLIGHT_1);
+
+	if (debug)
+		printk(KERN_DEBUG DRIVER "read brightness of %d\n",
+		       intensity);
+
+	return intensity;
+}
+
+static const struct hw_data gmux_data = {
+	.iostart = PORT_BACKLIGHT_1,
+	.iolen = 4,
+	.backlight_ops		= {
+		.options	= BL_CORE_SUSPENDRESUME,
+		.get_brightness	= gmux_get_intensity,
+		.update_status	= gmux_send_intensity
+	},
+	.set_brightness = gmux_set_brightness,
+};
+
+static int apple_bl_add(struct acpi_device *dev)
 {
 	struct backlight_properties props;
 	struct pci_dev *host;
@@ -152,10 +200,13 @@ static int __devinit apple_bl_add(struct acpi_device *dev)
 		return -ENODEV;
 	}
 
-	if (host->vendor == PCI_VENDOR_ID_INTEL)
-		hw_data = &intel_chipset_data;
-	else if (host->vendor == PCI_VENDOR_ID_NVIDIA)
-		hw_data = &nvidia_chipset_data;
+	if (use_gmux == 0) {
+		if (host->vendor == PCI_VENDOR_ID_INTEL)
+			hw_data = &intel_chipset_data;
+		else if (host->vendor == PCI_VENDOR_ID_NVIDIA)
+			hw_data = &nvidia_chipset_data;
+	} else
+		hw_data = &gmux_data;
 
 	pci_dev_put(host);
 
@@ -170,24 +221,28 @@ static int __devinit apple_bl_add(struct acpi_device *dev)
 
 	if (!intensity) {
 		hw_data->set_brightness(1);
-		if (!hw_data->backlight_ops.get_brightness(NULL))
+		if (!hw_data->backlight_ops.get_brightness(NULL)) {
+			printk(KERN_ERR DRIVER "cannot set brightness - no device found\n");
 			return -ENODEV;
-
+		}
 		hw_data->set_brightness(0);
 	}
 
 	if (!request_region(hw_data->iostart, hw_data->iolen,
-			    "Apple backlight"))
+						"Apple backlight")) {
+		printk(KERN_ERR DRIVER "cannot request backlight region\n");
 		return -ENXIO;
+	}
 
 	memset(&props, 0, sizeof(struct backlight_properties));
 	props.type = BACKLIGHT_PLATFORM;
-	props.max_brightness = 15;
-	apple_backlight_device = backlight_device_register("apple_backlight",
+	props.max_brightness = use_gmux ? max_brightness : 15;
+	apple_backlight_device = backlight_device_register("acpi_video0",
 				  NULL, NULL, &hw_data->backlight_ops, &props);
 
-	if (IS_ERR(apple_backlight_device)) {
+	if (IS_ERR(apple_backlight_device) || !apple_backlight_device) {
 		release_region(hw_data->iostart, hw_data->iolen);
+		printk(KERN_ERR DRIVER "cannot register device\n");
 		return PTR_ERR(apple_backlight_device);
 	}
 
@@ -198,12 +253,12 @@ static int __devinit apple_bl_add(struct acpi_device *dev)
 	return 0;
 }
 
-static int __devexit apple_bl_remove(struct acpi_device *dev, int type)
+static int apple_bl_remove(struct acpi_device *dev, int type)
 {
 	backlight_device_unregister(apple_backlight_device);
-
 	release_region(hw_data->iostart, hw_data->iolen);
 	hw_data = NULL;
+	apple_backlight_device = NULL;
 	return 0;
 }
 
