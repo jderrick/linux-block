@@ -67,6 +67,10 @@ module_param_named(vbt_sdvo_panel_type, i915_vbt_sdvo_panel_type, int, 0600);
 static bool i915_try_reset = true;
 module_param_named(reset, i915_try_reset, bool, 0600);
 
+unsigned int i915_lvds_channels = 0;
+module_param_named(lvds_channels, i915_lvds_channels, int, 0600);
+MODULE_PARM_DESC(lvds_channels, "LVDS channels in use: 0=(default) probe hardware 1=single 2=dual");
+
 static struct drm_driver driver;
 extern int intel_agp_enabled;
 

@@ -642,6 +642,17 @@ static const intel_limit_t intel_limits_ironlake_display_port = {
         .find_pll = intel_find_pll_ironlake_dp,
 };
 
+static bool intel_lvds_is_dual_channel_mode(struct drm_i915_private *dev_priv,
+					    int lvds_reg)
+{
+	/* Did the user specify the number of channels? */
+	if (i915_lvds_channels)
+		return i915_lvds_channels == 2;
+
+	/* No, let's probe the current status of the hardware instead. */
+	return (I915_READ(lvds_reg) & LVDS_CLKB_POWER_MASK) == LVDS_CLKB_POWER_UP;
+}
+
 static const intel_limit_t *intel_ironlake_limit(struct drm_crtc *crtc,
 						int refclk)
 {
@@ -650,8 +661,7 @@ static const intel_limit_t *intel_ironlake_limit(struct drm_crtc *crtc,
 	const intel_limit_t *limit;
 
 	if (intel_pipe_has_type(crtc, INTEL_OUTPUT_LVDS)) {
-		if ((I915_READ(PCH_LVDS) & LVDS_CLKB_POWER_MASK) ==
-		    LVDS_CLKB_POWER_UP) {
+		if (intel_lvds_is_dual_channel_mode(dev_priv, PCH_LVDS)) {
 			/* LVDS dual channel */
 			if (refclk == 100000)
 				limit = &intel_limits_ironlake_dual_lvds_100m;
@@ -679,8 +689,7 @@ static const intel_limit_t *intel_g4x_limit(struct drm_crtc *crtc)
 	const intel_limit_t *limit;
 
 	if (intel_pipe_has_type(crtc, INTEL_OUTPUT_LVDS)) {
-		if ((I915_READ(LVDS) & LVDS_CLKB_POWER_MASK) ==
-		    LVDS_CLKB_POWER_UP)
+		if (intel_lvds_is_dual_channel_mode(dev_priv, LVDS))
 			/* LVDS with dual channel */
 			limit = &intel_limits_g4x_dual_channel_lvds;
 		else
@@ -811,14 +820,7 @@ intel_find_best_PLL(const intel_limit_t *limit, struct drm_crtc *crtc,
 
 	if (intel_pipe_has_type(crtc, INTEL_OUTPUT_LVDS) &&
 	    (I915_READ(LVDS)) != 0) {
-		/*
-		 * For LVDS, if the panel is on, just rely on its current
-		 * settings for dual-channel.  We haven't figured out how to
-		 * reliably set up different single/dual channel state, if we
-		 * even can.
-		 */
-		if ((I915_READ(LVDS) & LVDS_CLKB_POWER_MASK) ==
-		    LVDS_CLKB_POWER_UP)
+		if (intel_lvds_is_dual_channel_mode(dev_priv, LVDS))
 			clock.p2 = limit->p2.p2_fast;
 		else
 			clock.p2 = limit->p2.p2_slow;
@@ -882,8 +884,8 @@ intel_g4x_find_best_PLL(const intel_limit_t *limit, struct drm_crtc *crtc,
 			lvds_reg = PCH_LVDS;
 		else
 			lvds_reg = LVDS;
-		if ((I915_READ(lvds_reg) & LVDS_CLKB_POWER_MASK) ==
-		    LVDS_CLKB_POWER_UP)
+
+		if (intel_lvds_is_dual_channel_mode(dev_priv, lvds_reg))
 			clock.p2 = limit->p2.p2_fast;
 		else
 			clock.p2 = limit->p2.p2_slow;
@@ -4801,7 +4803,7 @@ static int intel_crtc_mode_set(struct drm_crtc *crtc,
 		if (is_lvds) {
 			if ((intel_panel_use_ssc(dev_priv) &&
 			     dev_priv->lvds_ssc_freq == 100) ||
-			    (I915_READ(PCH_LVDS) & LVDS_CLKB_POWER_MASK) == LVDS_CLKB_POWER_UP)
+		    intel_lvds_is_dual_channel_mode(dev_priv, PCH_LVDS))
 				factor = 25;
 		} else if (is_sdvo && is_tv)
 			factor = 20;
