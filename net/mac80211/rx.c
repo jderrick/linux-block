@@ -2906,8 +2906,8 @@ void ieee80211_rx(struct ieee80211_hw *hw, struct sk_buff *skb)
 				 status->rate_idx))
 				goto drop;
 		} else {
-			if (WARN_ON(status->rate_idx < 0 ||
-				    status->rate_idx >= sband->n_bitrates))
+			if (status->rate_idx < 0 ||
+			    status->rate_idx >= sband->n_bitrates)
 				goto drop;
 			rate = &sband->bitrates[status->rate_idx];
 		}
