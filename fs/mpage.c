@@ -605,6 +605,7 @@ alloc_new:
 				bio_get_nr_vecs(bdev), GFP_NOFS|__GFP_HIGH);
 		if (bio == NULL)
 			goto confused;
+		bio_set_streamid(bio, inode_streamid(inode));
 	}
 
 	/*

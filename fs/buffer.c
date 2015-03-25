@@ -1774,7 +1774,7 @@ static int __block_write_full_page(struct inode *inode, struct page *page,
 	do {
 		struct buffer_head *next = bh->b_this_page;
 		if (buffer_async_write(bh)) {
-			submit_bh(write_op, bh);
+			_submit_bh(write_op, bh, streamid_to_flags(inode_streamid(inode)));
 			nr_underway++;
 		}
 		bh = next;
@@ -1828,7 +1828,7 @@ recover:
 		struct buffer_head *next = bh->b_this_page;
 		if (buffer_async_write(bh)) {
 			clear_buffer_dirty(bh);
-			submit_bh(write_op, bh);
+			_submit_bh(write_op, bh, streamid_to_flags(inode_streamid(inode)));
 			nr_underway++;
 		}
 		bh = next;
