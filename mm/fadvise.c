@@ -60,6 +60,8 @@ SYSCALL_DEFINE4(fadvise64_64, int, fd, loff_t, offset, loff_t, len, int, advice)
 		case POSIX_FADV_WILLNEED:
 		case POSIX_FADV_NOREUSE:
 		case POSIX_FADV_DONTNEED:
+		case POSIX_FADV_STREAMID:
+		case POSIX_FADV_FILE_STREAMID:
 			/* no bad return value, but ignore advice */
 			break;
 		default:
@@ -142,6 +144,29 @@ SYSCALL_DEFINE4(fadvise64_64, int, fd, loff_t, offset, loff_t, len, int, advice)
 				invalidate_mapping_pages(mapping, start_index,
 						end_index);
 			}
+		}
+		break;
+	case POSIX_FADV_STREAMID:
+	case POSIX_FADV_FILE_STREAMID:
+		/*
+		 * streamid is stored in offset... we don't limit or check
+		 * if the device supports streams, or if it does, if the
+		 * stream nr is within the limits. 1 is the lowest valid
+		 * stream id, 0 is "don't care/know".
+		 */
+		if (offset != (unsigned int) offset) {
+			ret = -EINVAL;
+			break;
+		}
+		/*
+		 * FILE_STREAMID stores only in the file, STREAMID stores
+		 * the stream hint in both the file and the inode.
+		 */
+		f.file->f_streamid = offset;
+		if (advice == POSIX_FADV_STREAMID) {
+			spin_lock(&inode->i_lock);
+			inode->i_streamid = offset;
+			spin_unlock(&inode->i_lock);
 		}
 		break;
 	default:

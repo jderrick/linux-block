@@ -18,4 +18,7 @@
 #define POSIX_FADV_NOREUSE	5 /* Data will be accessed once.  */
 #endif
 
+#define POSIX_FADV_STREAMID	8 /* associate stream ID with file+inode */
+#define POSIX_FADV_FILE_STREAMID 9 /* associate stream ID with file */
+
 #endif	/* FADVISE_H_INCLUDED */
