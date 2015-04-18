@@ -1941,6 +1941,9 @@ void generic_make_request(struct bio *bio)
 	do {
 		struct request_queue *q = bdev_get_queue(bio->bi_bdev);
 
+		if (bio_streamid_valid(bio))
+			blk_add_trace_msg(q, "StreamID=%u", bio_get_streamid(bio));
+
 		q->make_request_fn(q, bio);
 
 		bio = bio_list_pop(current->bio_list);

@@ -138,8 +138,34 @@ struct bio {
 #define BIO_POOL_BITS		(4)
 #define BIO_POOL_NONE		((1UL << BIO_POOL_BITS) - 1)
 #define BIO_POOL_OFFSET		(BITS_PER_LONG - BIO_POOL_BITS)
-#define BIO_POOL_MASK		(1UL << BIO_POOL_OFFSET)
 #define BIO_POOL_IDX(bio)	((bio)->bi_flags >> BIO_POOL_OFFSET)
+
+/*
+ * after the pool bits, next 8 bits are for the stream id
+ */
+#define BIO_STREAM_BITS		(8)
+#define BIO_STREAM_OFFSET	(BIO_POOL_OFFSET - BIO_STREAM_BITS)
+#define BIO_STREAM_MASK		((1 << BIO_STREAM_BITS) - 1)
+
+static inline unsigned long streamid_to_flags(unsigned int id)
+{
+	return (unsigned long) (id & BIO_STREAM_MASK) << BIO_STREAM_OFFSET;
+}
+
+static inline void bio_set_streamid(struct bio *bio, unsigned int id)
+{
+	bio->bi_flags |= streamid_to_flags(id);
+}
+
+static inline unsigned int bio_get_streamid(struct bio *bio)
+{
+	return (bio->bi_flags >> BIO_STREAM_OFFSET) & BIO_STREAM_MASK;
+}
+
+static inline bool bio_streamid_valid(struct bio *bio)
+{
+	return bio_get_streamid(bio) != 0;
+}
 
 #endif /* CONFIG_BLOCK */
 
