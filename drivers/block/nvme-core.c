@@ -2236,7 +2236,7 @@ static int nvme_setup_io_queues(struct nvme_dev *dev)
 	nr_io_queues = num_possible_cpus();
 	result = set_queue_count(dev, nr_io_queues);
 	if (result <= 0)
-		return result;
+		return -ENODEV;
 	if (result < nr_io_queues)
 		nr_io_queues = result;
 
