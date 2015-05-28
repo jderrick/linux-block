@@ -1602,9 +1602,12 @@ static int nvme_shutdown_ctrl(struct nvme_dev *dev)
 
 static int nvme_subsys_reset(struct nvme_dev *dev)
 {
-	writel(0x4E564D65, &dev->bar->nssr);
+	if (dev->subsystem) {
+		writel(0x4E564D65, &dev->bar->nssr);
+		return 0;
+	}
 
-	return 0;
+	return -EINVAL;
 }
 
 static struct blk_mq_ops nvme_mq_admin_ops = {
@@ -1856,7 +1859,7 @@ static int nvme_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cmd,
 							unsigned long arg)
 {
 	struct nvme_ns *ns = bdev->bd_disk->private_data;
-
+	pr_info("NVMe:: %s %#X\n", __func__, cmd);
 	switch (cmd) {
 	case NVME_IOCTL_ID:
 		force_successful_syscall_return();
@@ -1867,8 +1870,6 @@ static int nvme_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cmd,
 		return nvme_user_cmd(ns->dev, ns, (void __user *)arg);
 	case NVME_IOCTL_SUBMIT_IO:
 		return nvme_submit_io(ns, (void __user *)arg);
-	case NVME_IOCTL_NSSR:
-		return nvme_subsys_reset(ns->dev);
 	case SG_GET_VERSION_NUM:
 		return nvme_sg_get_version_num((void __user *)arg);
 	case SG_IO:
@@ -2711,7 +2712,7 @@ static long nvme_dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 {
 	struct nvme_dev *dev = f->private_data;
 	struct nvme_ns *ns;
-
+	pr_info("NVMe:: %s %#X\n", __func__, cmd);
 	switch (cmd) {
 	case NVME_IOCTL_ADMIN_CMD:
 		return nvme_user_cmd(dev, NULL, (void __user *)arg);
@@ -2720,6 +2721,8 @@ static long nvme_dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 			return -ENOTTY;
 		ns = list_first_entry(&dev->namespaces, struct nvme_ns, list);
 		return nvme_user_cmd(dev, ns, (void __user *)arg);
+	case NVME_IOCTL_SUBSYS_RESET:
+		return nvme_subsys_reset(dev);
 	default:
 		return -ENOTTY;
 	}
