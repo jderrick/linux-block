@@ -1600,7 +1600,7 @@ static int nvme_shutdown_ctrl(struct nvme_dev *dev)
 	return 0;
 }
 
-static int nvme_ss_reset(struct nvme_dev *dev)
+static int nvme_subsys_reset(struct nvme_dev *dev)
 {
 	writel(0x4E564D65, &dev->bar->nssr);
 
@@ -1867,8 +1867,8 @@ static int nvme_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cmd,
 		return nvme_user_cmd(ns->dev, ns, (void __user *)arg);
 	case NVME_IOCTL_SUBMIT_IO:
 		return nvme_submit_io(ns, (void __user *)arg);
-	case NVME_IOCTL_NSSRC:
-		return nvme_ss_reset(ns->dev);
+	case NVME_IOCTL_NSSR:
+		return nvme_subsys_reset(ns->dev);
 	case SG_GET_VERSION_NUM:
 		return nvme_sg_get_version_num((void __user *)arg);
 	case SG_IO:
