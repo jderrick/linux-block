@@ -1600,6 +1600,13 @@ static int nvme_shutdown_ctrl(struct nvme_dev *dev)
 	return 0;
 }
 
+static int nvme_ss_reset(struct nvme_dev *dev)
+{
+	writel(0x4E564D65, &dev->bar->nssr);
+
+	return 0;
+}
+
 static struct blk_mq_ops nvme_mq_admin_ops = {
 	.queue_rq	= nvme_queue_rq,
 	.map_queue	= blk_mq_map_queue,
@@ -1680,6 +1687,12 @@ static int nvme_configure_admin_queue(struct nvme_dev *dev)
 				1 << dev_page_max, 1 << page_shift);
 		page_shift = dev_page_max;
 	}
+
+	dev->subsystem = readl(&dev->bar->vs) >= NVME_VS(1, 1) ?
+						NVME_CAP_NSSRC(cap) : 0;
+
+	if (dev->subsystem && (readl(&dev->bar->csts) & NVME_CSTS_NSSRO))
+		writel(NVME_CSTS_NSSRO, &dev->bar->csts);
 
 	result = nvme_disable_ctrl(dev, cap);
 	if (result < 0)
@@ -1854,6 +1867,8 @@ static int nvme_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cmd,
 		return nvme_user_cmd(ns->dev, ns, (void __user *)arg);
 	case NVME_IOCTL_SUBMIT_IO:
 		return nvme_submit_io(ns, (void __user *)arg);
+	case NVME_IOCTL_NSSRC:
+		return nvme_ss_reset(ns->dev);
 	case SG_GET_VERSION_NUM:
 		return nvme_sg_get_version_num((void __user *)arg);
 	case SG_IO:
@@ -1998,7 +2013,10 @@ static int nvme_kthread(void *data)
 		spin_lock(&dev_list_lock);
 		list_for_each_entry_safe(dev, next, &dev_list, node) {
 			int i;
-			if (readl(&dev->bar->csts) & NVME_CSTS_CFS) {
+			u32 csts = readl(&dev->bar->csts);
+
+			if ((dev->subsystem && (csts & NVME_CSTS_NSSRO)) ||
+							csts & NVME_CSTS_CFS) {
 				if (work_busy(&dev->reset_work))
 					continue;
 				list_del_init(&dev->node);
