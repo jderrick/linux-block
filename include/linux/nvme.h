@@ -79,6 +79,7 @@ struct nvme_dev {
 	struct dma_pool *prp_small_pool;
 	int instance;
 	unsigned queue_count;
+	unsigned vec_count;
 	unsigned online_queues;
 	unsigned max_qid;
 	int q_depth;
