@@ -117,6 +117,7 @@ struct nvme_queue {
 	u8 cq_phase;
 	u8 cqe_seen;
 	struct async_cmd_info cmdinfo;
+	bool cmb_mapped;
 };
 
 /*
@@ -1361,8 +1362,13 @@ static void nvme_free_queue(struct nvme_queue *nvmeq)
 {
 	dma_free_coherent(nvmeq->q_dmadev, CQ_SIZE(nvmeq->q_depth),
 				(void *)nvmeq->cqes, nvmeq->cq_dma_addr);
-	dma_free_coherent(nvmeq->q_dmadev, SQ_SIZE(nvmeq->q_depth),
-					nvmeq->sq_cmds, nvmeq->sq_dma_addr);
+
+	if (nvmeq->cmb_mapped)
+		iounmap(nvmeq->sq_cmds);
+	else
+		dma_free_coherent(nvmeq->q_dmadev, SQ_SIZE(nvmeq->q_depth),
+						nvmeq->sq_cmds, nvmeq->sq_dma_addr);
+
 	kfree(nvmeq);
 }
 
@@ -1434,6 +1440,38 @@ static void nvme_disable_queue(struct nvme_dev *dev, int qid)
 	spin_unlock_irq(&nvmeq->q_lock);
 }
 
+static struct nvme_command *nvme_alloc_queue_on_cmb(struct nvme_queue *nvmeq,
+				struct nvme_dev *dev, int qid,
+				int q_size, dma_addr_t *q_dma_addr)
+{
+	struct nvme_command *q;
+	u64 szu, cmb_size, bar_size, offset;
+	struct pci_dev *pdev = to_pci_dev(dev->dev);
+
+	szu = 1 << (12 + 4 * NVME_CMB_SZU(dev->cmbsz));
+	cmb_size = szu * NVME_CMB_SZ(dev->cmbsz);
+	offset = szu * NVME_CMB_OFST(dev->cmbloc);
+	bar_size = pci_resource_len(pdev, NVME_CMB_BIR(dev->cmbloc));
+
+	if (cmb_size > bar_size - offset);
+		cmb_size = bar_size - offset;
+
+	if (q_size * qid <= cmb_size) {
+		*q_dma_addr = pci_resource_start(pdev,
+				NVME_CMB_BIR(dev->cmbloc)) +
+				offset + q_size * (qid - 1);
+
+		q = ioremap(*q_dma_addr, q_size);
+		if (q)
+			nvmeq->cmb_mapped = true;
+
+		return q;
+	}
+
+	return NULL;
+
+}
+
 static struct nvme_queue *nvme_alloc_queue(struct nvme_dev *dev, int qid,
 							int depth)
 {
@@ -1446,8 +1484,14 @@ static struct nvme_queue *nvme_alloc_queue(struct nvme_dev *dev, int qid,
 	if (!nvmeq->cqes)
 		goto free_nvmeq;
 
-	nvmeq->sq_cmds = dma_alloc_coherent(dev->dev, SQ_SIZE(depth),
-					&nvmeq->sq_dma_addr, GFP_KERNEL);
+	if (qid && NVME_CMB_SQS(dev->cmbsz))
+		nvmeq->sq_cmds = nvme_alloc_queue_on_cmb(nvmeq, dev, qid,
+					SQ_SIZE(depth), &nvmeq->sq_dma_addr);
+
+	if (!nvmeq->sq_cmds)
+		nvmeq->sq_cmds = dma_alloc_coherent(dev->dev, SQ_SIZE(depth),
+						&nvmeq->sq_dma_addr, GFP_KERNEL);
+
 	if (!nvmeq->sq_cmds)
 		goto free_cqdma;
 
@@ -2410,6 +2454,9 @@ static int nvme_dev_map(struct nvme_dev *dev)
 	dev->q_depth = min_t(int, NVME_CAP_MQES(cap) + 1, NVME_Q_DEPTH);
 	dev->db_stride = 1 << NVME_CAP_STRIDE(cap);
 	dev->dbs = ((void __iomem *)dev->bar) + 4096;
+
+	dev->cmbsz = readl(&dev->bar->cmbsz);
+	dev->cmbloc = readl(&dev->bar->cmbloc);
 
 	return 0;
 
