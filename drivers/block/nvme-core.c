@@ -1462,6 +1462,7 @@ static struct nvme_queue *nvme_alloc_queue(struct nvme_dev *dev, int qid,
 	nvmeq->q_db = &dev->dbs[qid * 2 * dev->db_stride];
 	nvmeq->q_depth = depth;
 	nvmeq->qid = qid;
+	nvmeq->cq_vector = -1;
 	dev->queues[qid] = nvmeq;
 
 	/* make sure queue descriptor is set before queue count, for kthread */
@@ -1712,8 +1713,10 @@ static int nvme_configure_admin_queue(struct nvme_dev *dev)
 
 	nvmeq->cq_vector = 0;
 	result = queue_request_irq(dev, nvmeq, nvmeq->irqname);
-	if (result)
+	if (result) {
+		nvmeq->cq_vector = -1;
 		goto free_nvmeq;
+	}
 
 	return result;
 
@@ -2197,9 +2200,12 @@ static int nvme_setup_io_queues(struct nvme_dev *dev)
 	nr_io_queues = vecs;
 	dev->max_qid = nr_io_queues;
 
-	result = queue_request_irq(dev, adminq, adminq->irqname);
-	if (result)
+	//result = queue_request_irq(dev, adminq, adminq->irqname);
+	result = -ENODEV;
+	if (result) {
+		adminq->cq_vector = -1;
 		goto free_queues;
+	}
 
 	/* Free previously allocated queues that are no longer usable */
 	nvme_free_queues(dev, nr_io_queues + 1);
