@@ -2345,6 +2345,26 @@ int blk_mq_update_nr_requests(struct request_queue *q, unsigned int nr)
 	return ret;
 }
 
+void blk_mq_update_nr_hw_requests(struct blk_mq_tag_set *set,
+				  int nr_requests)
+{
+	struct request_queue *q;
+
+	if (nr_requests < set->reserved_tags + 1 ||
+	    nr_requests == set->queue_depth)
+		return;
+
+	list_for_each_entry(q, &set->tag_list, tag_set_list)
+		blk_mq_freeze_queue(q);
+
+	list_for_each_entry(q, &set->tag_list, tag_set_list)
+		blk_mq_update_nr_requests(q, nr_requests);
+
+	list_for_each_entry(q, &set->tag_list, tag_set_list)
+		blk_mq_unfreeze_queue(q);
+}
+EXPORT_SYMBOL_GPL(blk_mq_update_nr_hw_requests);
+
 void blk_mq_update_nr_hw_queues(struct blk_mq_tag_set *set, int nr_hw_queues)
 {
 	struct request_queue *q;
