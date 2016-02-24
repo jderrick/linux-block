@@ -60,10 +60,6 @@
 static int use_threaded_interrupts;
 module_param(use_threaded_interrupts, int, 0);
 
-static bool use_cmb_sqes = true;
-module_param(use_cmb_sqes, bool, 0644);
-MODULE_PARM_DESC(use_cmb_sqes, "use controller's memory buffer for I/O SQes");
-
 static LIST_HEAD(dev_list);
 static DEFINE_SPINLOCK(dev_list_lock);
 static struct task_struct *nvme_thread;
@@ -102,10 +98,6 @@ struct nvme_dev {
 	struct work_struct remove_work;
 	struct mutex shutdown_lock;
 	bool subsystem;
-	void __iomem *cmb;
-	dma_addr_t cmb_dma_addr;
-	u64 cmb_size;
-	u32 cmbsz;
 	unsigned long flags;
 
 #define NVME_CTRL_RESETTING    0
@@ -999,13 +991,29 @@ static void nvme_cancel_queue_ios(struct request *req, void *data, bool reserved
 	blk_mq_complete_request(req, status);
 }
 
-static void nvme_free_queue(struct nvme_queue *nvmeq)
+static void nvme_release_sq(struct nvme_queue *nvmeq)
 {
-	dma_free_coherent(nvmeq->q_dmadev, CQ_SIZE(nvmeq->q_depth),
-				(void *)nvmeq->cqes, nvmeq->cq_dma_addr);
 	if (nvmeq->sq_cmds)
 		dma_free_coherent(nvmeq->q_dmadev, SQ_SIZE(nvmeq->q_depth),
 					nvmeq->sq_cmds, nvmeq->sq_dma_addr);
+
+	nvmeq->sq_cmds = NULL;
+	nvmeq->sq_cmds_io = NULL;
+}
+
+static void nvme_release_cq(struct nvme_queue *nvmeq)
+{
+	if (nvmeq->cqes)
+		dma_free_coherent(nvmeq->q_dmadev, CQ_SIZE(nvmeq->q_depth),
+				(void *)nvmeq->cqes, nvmeq->cq_dma_addr);
+
+	nvmeq->cqes = NULL;
+}
+
+static void nvme_free_queue(struct nvme_queue *nvmeq)
+{
+	nvme_release_sq(nvmeq);
+	nvme_release_cq(nvmeq);
 	kfree(nvmeq);
 }
 
@@ -1076,38 +1084,31 @@ static void nvme_disable_admin_queue(struct nvme_dev *dev, bool shutdown)
 	spin_unlock_irq(&nvmeq->q_lock);
 }
 
-static int nvme_cmb_qdepth(struct nvme_dev *dev, int nr_io_queues,
-				int entry_size)
+static int nvme_cmb_sq_depth(struct nvme_dev *dev, int nr_io_queues)
 {
-	int q_depth = dev->q_depth;
-	unsigned q_size_aligned = roundup(q_depth * entry_size,
-					  dev->ctrl.page_size);
+	struct nvme_cmb *cmb = dev->ctrl.cmb;
+	u32 sq_size;
+	u64 sqes_size;
 
-	if (q_size_aligned * nr_io_queues > dev->cmb_size) {
-		u64 mem_per_q = div_u64(dev->cmb_size, nr_io_queues);
-		mem_per_q = round_down(mem_per_q, dev->ctrl.page_size);
-		q_depth = div_u64(mem_per_q, entry_size);
+	if (!cmb->sq_depth)
+		return -EINVAL;
 
-		/*
-		 * Ensure the reduced q_depth is above some threshold where it
-		 * would be better to map queues in system memory with the
-		 * original depth
-		 */
-		if (q_depth < 64)
-			return -ENOMEM;
-	}
+	sq_size = cmb->sq_depth * sizeof(struct nvme_command);
+	sqes_size = sq_size * nr_io_queues;
+	if (cmb->sq_offset + sqes_size > cmb->size)
+		return -ENOMEM;
 
-	return q_depth;
+	return cmb->sq_depth;
 }
 
 static int nvme_alloc_sq_cmds(struct nvme_dev *dev, struct nvme_queue *nvmeq,
 				int qid, int depth)
 {
-	if (qid && dev->cmb && use_cmb_sqes && NVME_CMB_SQS(dev->cmbsz)) {
-		unsigned offset = (qid - 1) * roundup(SQ_SIZE(depth),
-						      dev->ctrl.page_size);
-		nvmeq->sq_dma_addr = dev->cmb_dma_addr + offset;
-		nvmeq->sq_cmds_io = dev->cmb + offset;
+	struct nvme_cmb *cmb = dev->ctrl.cmb;
+	if (qid && cmb->cmb && cmb->sq_depth) {
+		u32 offset = (qid - 1) * SQ_SIZE(depth);
+		nvmeq->sq_dma_addr = cmb->dma_addr + offset;
+		nvmeq->sq_cmds_io = cmb->cmb + offset;
 	} else {
 		nvmeq->sq_cmds = dma_alloc_coherent(dev->dev, SQ_SIZE(depth),
 					&nvmeq->sq_dma_addr, GFP_KERNEL);
@@ -1116,6 +1117,27 @@ static int nvme_alloc_sq_cmds(struct nvme_dev *dev, struct nvme_queue *nvmeq,
 	}
 
 	return 0;
+}
+
+static bool nvme_queue_needs_remap(struct nvme_dev *dev, struct nvme_queue *nvmeq)
+{
+	if (dev->queue_count > 1) {
+		struct nvme_cmb *cmb = dev->ctrl.cmb;
+		/*
+		 * This condition occurs if SQes were previously mapped
+		 * in Memory or CMB and need to be switched over to the
+		 * other. This also occurs if SQes are currently mapped
+		 * in the CMB and CMB parameters change.
+		 *
+		 * However it doesn't hurt to remap CMB SQes if the
+		 * parameters don't change, so to simplify we can check
+		 * if they are currently in the CMB or will be in the
+		 * CMB after queue creation.
+		 */
+		return (nvmeq->sq_cmds_io || cmb->sq_depth);
+	}
+
+	return false;
 }
 
 static struct nvme_queue *nvme_alloc_queue(struct nvme_dev *dev, int qid,
@@ -1370,6 +1392,30 @@ static int nvme_kthread(void *data)
 	return 0;
 }
 
+static int nvme_remap_queue(struct nvme_dev *dev, struct nvme_queue *nvmeq)
+{
+	struct nvme_cmb *cmb = dev->ctrl.cmb;
+
+	nvme_release_sq(nvmeq);
+	nvme_release_cq(nvmeq);
+
+	if (!cmb->sq_depth)
+		dev->q_depth = dev->tagset.queue_depth;
+	nvmeq->q_depth = dev->q_depth;
+
+	nvmeq->cqes = dma_zalloc_coherent(dev->dev, CQ_SIZE(nvmeq->q_depth),
+					  &nvmeq->cq_dma_addr, GFP_KERNEL);
+	if (!nvmeq->cqes)
+		return -ENOMEM;
+
+	if (nvme_alloc_sq_cmds(dev, nvmeq, nvmeq->qid, nvmeq->q_depth)) {
+		dma_free_coherent(dev->dev, CQ_SIZE(nvmeq->q_depth),
+				(void *)nvmeq->cqes, nvmeq->cq_dma_addr);
+		return -ENOMEM;
+	}
+	return 0;
+}
+
 static int nvme_create_io_queues(struct nvme_dev *dev)
 {
 	unsigned i, max;
@@ -1384,6 +1430,14 @@ static int nvme_create_io_queues(struct nvme_dev *dev)
 
 	max = min(dev->max_qid, dev->queue_count - 1);
 	for (i = dev->online_queues; i <= max; i++) {
+		if (nvme_queue_needs_remap(dev, dev->queues[i])) {
+			ret = nvme_remap_queue(dev, dev->queues[i]);
+			if (ret) {
+				nvme_free_queues(dev, i);
+				break;
+			}
+		}
+
 		ret = nvme_create_queue(dev->queues[i], i);
 		if (ret) {
 			nvme_free_queues(dev, i);
@@ -1400,31 +1454,33 @@ static int nvme_create_io_queues(struct nvme_dev *dev)
 	return ret >= 0 ? 0 : ret;
 }
 
-static void __iomem *nvme_map_cmb(struct nvme_dev *dev)
+static int nvme_pci_map_cmb(struct nvme_ctrl *ctrl)
 {
 	u64 szu, size, offset;
-	u32 cmbloc;
+	u32 cmbsz, cmbloc;
 	resource_size_t bar_size;
-	struct pci_dev *pdev = to_pci_dev(dev->dev);
-	void __iomem *cmb;
+	struct nvme_cmb *cmb = ctrl->cmb;
+	struct pci_dev *pdev = to_pci_dev(ctrl->dev);
+	struct nvme_dev *dev = to_nvme_dev(ctrl);
 	dma_addr_t dma_addr;
+	void __iomem *cmb_ioaddr;
 
-	if (!use_cmb_sqes)
-		return NULL;
-
-	dev->cmbsz = readl(dev->bar + NVME_REG_CMBSZ);
-	if (!(NVME_CMB_SZ(dev->cmbsz)))
-		return NULL;
+	cmbsz = readl(dev->bar + NVME_REG_CMBSZ);
+	if (!(NVME_CMB_SZ(cmbsz)))
+		return -EINVAL;
 
 	cmbloc = readl(dev->bar + NVME_REG_CMBLOC);
 
-	szu = (u64)1 << (12 + 4 * NVME_CMB_SZU(dev->cmbsz));
-	size = szu * NVME_CMB_SZ(dev->cmbsz);
+	szu = (u64)1 << (12 + 4 * NVME_CMB_SZU(cmbsz));
+	size = szu * NVME_CMB_SZ(cmbsz);
 	offset = szu * NVME_CMB_OFST(cmbloc);
 	bar_size = pci_resource_len(pdev, NVME_CMB_BIR(cmbloc));
 
-	if (offset > bar_size)
-		return NULL;
+	if (offset > bar_size) {
+		dev_warn(dev->dev, "CMB supported but offset does not fit "
+			"within bar (%#llx/%#llx)\n", offset, bar_size);
+		return -ENOMEM;
+	}
 
 	/*
 	 * Controllers may support a CMB size larger than their BAR,
@@ -1435,20 +1491,28 @@ static void __iomem *nvme_map_cmb(struct nvme_dev *dev)
 		size = bar_size - offset;
 
 	dma_addr = pci_resource_start(pdev, NVME_CMB_BIR(cmbloc)) + offset;
-	cmb = ioremap_wc(dma_addr, size);
-	if (!cmb)
-		return NULL;
+	cmb_ioaddr = ioremap_wc(dma_addr, size);
+	if (!cmb_ioaddr)
+		return -ENOMEM;
 
-	dev->cmb_dma_addr = dma_addr;
-	dev->cmb_size = size;
-	return cmb;
+	cmb->cmb = cmb_ioaddr;
+	cmb->dma_addr = dma_addr;
+	cmb->size = size;
+	cmb->flags |= NVME_CMB_SQS(cmbsz) ? NVME_CMB_SQ_SUPPORTED : 0;
+	cmb->flags |= NVME_CMB_CQS(cmbsz) ? NVME_CMB_CQ_SUPPORTED : 0;
+	cmb->flags |= NVME_CMB_WDS(cmbsz) ? NVME_CMB_WD_SUPPORTED : 0;
+	cmb->flags |= NVME_CMB_RDS(cmbsz) ? NVME_CMB_RD_SUPPORTED : 0;
+	cmb->flags |= NVME_CMB_LISTS(cmbsz) ? NVME_CMB_PRP_SUPPORTED : 0;
+	return 0;
 }
 
-static inline void nvme_release_cmb(struct nvme_dev *dev)
+static void nvme_pci_unmap_cmb(struct nvme_ctrl *ctrl)
 {
-	if (dev->cmb) {
-		iounmap(dev->cmb);
-		dev->cmb = NULL;
+	struct nvme_cmb *cmb = ctrl->cmb;
+	if (cmb->cmb) {
+		iounmap(cmb->cmb);
+		cmb->cmb = NULL;
+		cmb->dma_addr = 0;
 	}
 }
 
@@ -1461,6 +1525,7 @@ static int nvme_setup_io_queues(struct nvme_dev *dev)
 {
 	struct nvme_queue *adminq = dev->queues[0];
 	struct pci_dev *pdev = to_pci_dev(dev->dev);
+	struct nvme_cmb *cmb = dev->ctrl.cmb;
 	int result, i, vecs, nr_io_queues, size;
 
 	nr_io_queues = num_possible_cpus();
@@ -1480,13 +1545,12 @@ static int nvme_setup_io_queues(struct nvme_dev *dev)
 		result = 0;
 	}
 
-	if (dev->cmb && NVME_CMB_SQS(dev->cmbsz)) {
-		result = nvme_cmb_qdepth(dev, nr_io_queues,
-				sizeof(struct nvme_command));
+	if (cmb->flags & NVME_CMB_SQ_SUPPORTED) {
+		result = nvme_cmb_sq_depth(dev, nr_io_queues);
 		if (result > 0)
 			dev->q_depth = result;
 		else
-			nvme_release_cmb(dev);
+			cmb->sq_depth = 0;
 	}
 
 	size = db_bar_size(dev, nr_io_queues);
@@ -1675,6 +1739,7 @@ static int nvme_dev_add(struct nvme_dev *dev)
 			return 0;
 		dev->ctrl.tagset = &dev->tagset;
 	} else {
+		blk_mq_update_nr_hw_requests(&dev->tagset, dev->q_depth);
 		blk_mq_update_nr_hw_queues(&dev->tagset, dev->online_queues - 1);
 
 		/* Free previously allocated queues that are no longer usable */
@@ -1744,7 +1809,7 @@ static int nvme_dev_map(struct nvme_dev *dev)
 	}
 
 	if (readl(dev->bar + NVME_REG_VS) >= NVME_VS(1, 2))
-		dev->cmb = nvme_map_cmb(dev);
+		nvme_map_cmb(&dev->ctrl);
 
 	pci_enable_pcie_error_reporting(pdev);
 	pci_save_state(pdev);
@@ -1827,6 +1892,7 @@ static void nvme_dev_list_remove(struct nvme_dev *dev)
 
 static void nvme_dev_disable(struct nvme_dev *dev, bool shutdown)
 {
+	struct nvme_cmb *cmb = dev->ctrl.cmb;
 	int i;
 	u32 csts = -1;
 
@@ -1846,6 +1912,9 @@ static void nvme_dev_disable(struct nvme_dev *dev, bool shutdown)
 		nvme_disable_io_queues(dev);
 		nvme_disable_admin_queue(dev, shutdown);
 	}
+
+	if (cmb->cmb)
+		nvme_unmap_cmb(&dev->ctrl);
 	nvme_dev_unmap(dev);
 
 	for (i = dev->queue_count - 1; i >= 0; i--)
@@ -2032,6 +2101,8 @@ static const struct nvme_ctrl_ops nvme_pci_ctrl_ops = {
 	.io_incapable		= nvme_pci_io_incapable,
 	.reset_ctrl		= nvme_pci_reset_ctrl,
 	.free_ctrl		= nvme_pci_free_ctrl,
+	.map_cmb		= nvme_pci_map_cmb,
+	.unmap_cmb		= nvme_pci_unmap_cmb,
 };
 
 static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
@@ -2118,11 +2189,10 @@ static void nvme_remove(struct pci_dev *pdev)
 	flush_work(&dev->reset_work);
 	flush_work(&dev->scan_work);
 	nvme_remove_namespaces(&dev->ctrl);
-	nvme_uninit_ctrl(&dev->ctrl);
 	nvme_dev_disable(dev, true);
+	nvme_uninit_ctrl(&dev->ctrl);
 	nvme_dev_remove_admin(dev);
 	nvme_free_queues(dev, 0);
-	nvme_release_cmb(dev);
 	nvme_release_prp_pools(dev);
 	nvme_put_ctrl(&dev->ctrl);
 }

@@ -72,6 +72,7 @@ struct nvme_ctrl {
 	struct mutex namespaces_mutex;
 	struct device *device;	/* char device */
 	struct list_head node;
+	struct nvme_cmb *cmb;
 
 	char name[12];
 	char serial[20];
@@ -116,6 +117,23 @@ struct nvme_ns {
 	u32 mode_select_block_len;
 };
 
+struct nvme_cmb {
+	void __iomem *cmb;
+	dma_addr_t dma_addr;
+	u64 size;
+	u64 sq_offset;
+	u16 sq_depth;
+	unsigned long flags;
+};
+
+enum nvme_cmb_flags {
+	NVME_CMB_SQ_SUPPORTED	= (1 << 0),
+	NVME_CMB_CQ_SUPPORTED	= (1 << 1),
+	NVME_CMB_WD_SUPPORTED	= (1 << 2),
+	NVME_CMB_RD_SUPPORTED	= (1 << 3),
+	NVME_CMB_PRP_SUPPORTED	= (1 << 4),
+};
+
 struct nvme_ctrl_ops {
 	struct module *module;
 	int (*reg_read32)(struct nvme_ctrl *ctrl, u32 off, u32 *val);
@@ -124,6 +142,8 @@ struct nvme_ctrl_ops {
 	bool (*io_incapable)(struct nvme_ctrl *ctrl);
 	int (*reset_ctrl)(struct nvme_ctrl *ctrl);
 	void (*free_ctrl)(struct nvme_ctrl *ctrl);
+	int (*map_cmb)(struct nvme_ctrl *ctrl);
+	void (*unmap_cmb)(struct nvme_ctrl *ctrl);
 };
 
 static inline bool nvme_ctrl_ready(struct nvme_ctrl *ctrl)
@@ -238,6 +258,9 @@ int nvme_init_identify(struct nvme_ctrl *ctrl);
 
 void nvme_scan_namespaces(struct nvme_ctrl *ctrl);
 void nvme_remove_namespaces(struct nvme_ctrl *ctrl);
+
+void nvme_map_cmb(struct nvme_ctrl *ctrl);
+void nvme_unmap_cmb(struct nvme_ctrl *ctrl);
 
 void nvme_stop_queues(struct nvme_ctrl *ctrl);
 void nvme_start_queues(struct nvme_ctrl *ctrl);

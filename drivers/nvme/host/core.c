@@ -1035,6 +1035,89 @@ static ssize_t nvme_sysfs_reset(struct device *dev,
 }
 static DEVICE_ATTR(reset_controller, S_IWUSR, NULL, nvme_sysfs_reset);
 
+static ssize_t nvme_cmb_sq_depth_show(struct device *dev,
+					struct device_attribute *attr,
+					char *buf)
+{
+	struct nvme_ctrl *ctrl = dev_get_drvdata(dev);
+	struct nvme_cmb *cmb = ctrl->cmb;
+	return sprintf(buf, "%u\n", cmb->sq_depth);
+}
+
+static ssize_t nvme_cmb_sq_depth_store(struct device *dev,
+					struct device_attribute *attr,
+					const char *buf, size_t count)
+{
+	struct nvme_ctrl *ctrl = dev_get_drvdata(dev);
+	struct nvme_cmb *cmb = ctrl->cmb;
+	u32 sq_depth;
+
+	sscanf(buf, "%u", &sq_depth);
+	if (sq_depth > 0xffff)
+		return -EINVAL;
+
+	if (sq_depth > 0 && sq_depth < ctrl->tagset->reserved_tags + 1)
+		return -EINVAL;
+
+	cmb->sq_depth = sq_depth;
+	return count;
+}
+static DEVICE_ATTR(cmb_sq_depth, S_IWUSR | S_IRUGO, nvme_cmb_sq_depth_show,
+						nvme_cmb_sq_depth_store);
+
+static ssize_t nvme_cmb_sq_offset_show(struct device *dev,
+					struct device_attribute *attr,
+					char *buf)
+{
+	struct nvme_ctrl *ctrl = dev_get_drvdata(dev);
+	struct nvme_cmb *cmb = ctrl->cmb;
+	return sprintf(buf, "%llu\n", cmb->sq_offset);
+}
+
+static ssize_t nvme_cmb_sq_offset_store(struct device *dev,
+					struct device_attribute *attr,
+					const char *buf, size_t count)
+{
+	struct nvme_ctrl *ctrl = dev_get_drvdata(dev);
+	struct nvme_cmb *cmb = ctrl->cmb;
+	u64 sq_offset;
+
+	sscanf(buf, "%llu", &sq_offset);
+	if (sq_offset >= cmb->size)
+		return -EINVAL;
+
+	cmb->sq_offset = sq_offset;
+	return count;
+}
+static DEVICE_ATTR(cmb_sq_offset, S_IWUSR | S_IRUGO, nvme_cmb_sq_offset_show,
+						nvme_cmb_sq_offset_store);
+
+static struct attribute *nvme_cmb_attrs[] = {
+	&dev_attr_cmb_sq_depth.attr,
+	&dev_attr_cmb_sq_offset.attr,
+	NULL
+};
+
+static umode_t nvme_cmb_attrs_are_visible(struct kobject *kobj,
+		struct attribute *a, int n)
+{
+	struct device *dev = kobj_to_dev(kobj);
+	struct nvme_ctrl *ctrl = dev_get_drvdata(dev);
+	struct nvme_cmb *cmb = ctrl->cmb;
+
+	if ((a == &dev_attr_cmb_sq_depth.attr) ||
+	    (a == &dev_attr_cmb_sq_offset.attr)) {
+		if (!(cmb->flags & NVME_CMB_SQ_SUPPORTED))
+			return 0;
+	}
+	return a->mode;
+}
+
+static struct attribute_group nvme_cmb_attr_group = {
+	.attrs 		= nvme_cmb_attrs,
+	.is_visible	= nvme_cmb_attrs_are_visible,
+};
+
 static ssize_t uuid_show(struct device *dev, struct device_attribute *attr,
 								char *buf)
 {
@@ -1066,7 +1149,7 @@ static struct attribute *nvme_ns_attrs[] = {
 	NULL,
 };
 
-static umode_t nvme_attrs_are_visible(struct kobject *kobj,
+static umode_t nvme_ns_attrs_are_visible(struct kobject *kobj,
 		struct attribute *a, int n)
 {
 	struct device *dev = container_of(kobj, struct device, kobj);
@@ -1085,7 +1168,7 @@ static umode_t nvme_attrs_are_visible(struct kobject *kobj,
 
 static const struct attribute_group nvme_ns_attr_group = {
 	.attrs		= nvme_ns_attrs,
-	.is_visible	= nvme_attrs_are_visible,
+	.is_visible	= nvme_ns_attrs_are_visible,
 };
 
 #define nvme_show_function(field)						\
@@ -1344,6 +1427,47 @@ void nvme_remove_namespaces(struct nvme_ctrl *ctrl)
 }
 EXPORT_SYMBOL_GPL(nvme_remove_namespaces);
 
+static int nvme_init_cmb(struct nvme_ctrl *ctrl)
+{
+	/* Preserve across device resets */
+	if (ctrl->cmb)
+		return 0;
+
+	ctrl->cmb = kzalloc(sizeof(*ctrl->cmb), GFP_KERNEL);
+	if (!ctrl->cmb)
+		return -ENOMEM;
+
+	return 0;
+}
+
+static void nvme_release_cmb(struct nvme_ctrl *ctrl)
+{
+	if (ctrl->cmb) {
+		kfree(ctrl->cmb);
+		ctrl->cmb = NULL;
+	}
+}
+
+void nvme_map_cmb(struct nvme_ctrl *ctrl)
+{
+	struct device *dev = ctrl->device;
+
+	if (ctrl->ops->map_cmb(ctrl))
+		return;
+
+	if (sysfs_create_group(&dev->kobj, &nvme_cmb_attr_group))
+		dev_warn(dev, "failed to create sysfs group for CMB\n");
+}
+EXPORT_SYMBOL_GPL(nvme_map_cmb);
+
+void nvme_unmap_cmb(struct nvme_ctrl *ctrl)
+{
+	struct device *dev = ctrl->device;
+	ctrl->ops->unmap_cmb(ctrl);
+	sysfs_remove_group(&dev->kobj, &nvme_cmb_attr_group);
+}
+EXPORT_SYMBOL_GPL(nvme_unmap_cmb);
+
 static DEFINE_IDA(nvme_instance_ida);
 
 static int nvme_set_instance(struct nvme_ctrl *ctrl)
@@ -1388,6 +1512,7 @@ static void nvme_free_ctrl(struct kref *kref)
 	struct nvme_ctrl *ctrl = container_of(kref, struct nvme_ctrl, kref);
 
 	put_device(ctrl->device);
+	nvme_release_cmb(ctrl);
 	nvme_release_instance(ctrl);
 
 	ctrl->ops->free_ctrl(ctrl);
@@ -1430,11 +1555,18 @@ int nvme_init_ctrl(struct nvme_ctrl *ctrl, struct device *dev,
 	}
 	get_device(ctrl->device);
 
+	ret = nvme_init_cmb(ctrl);
+	if (ret)
+		goto out_destroy_device;
+
 	spin_lock(&dev_list_lock);
 	list_add_tail(&ctrl->node, &nvme_ctrl_list);
 	spin_unlock(&dev_list_lock);
 
 	return 0;
+out_destroy_device:
+	put_device(ctrl->device);
+	device_destroy(nvme_class, MKDEV(nvme_char_major, ctrl->instance));
 out_release_instance:
 	nvme_release_instance(ctrl);
 out:
