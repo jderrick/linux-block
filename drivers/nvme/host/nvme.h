@@ -258,6 +258,8 @@ int nvme_init_identify(struct nvme_ctrl *ctrl);
 void nvme_scan_namespaces(struct nvme_ctrl *ctrl);
 void nvme_remove_namespaces(struct nvme_ctrl *ctrl);
 
+int nvme_cmb_update_sq_depth(struct nvme_ctrl *ctrl, u32 sq_depth);
+int nvme_cmb_update_sq_offset(struct nvme_ctrl *ctrl, u64 sq_offset);
 void nvme_map_cmb(struct nvme_ctrl *ctrl);
 void nvme_unmap_cmb(struct nvme_ctrl *ctrl);
 

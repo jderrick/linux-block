@@ -1049,17 +1049,14 @@ static ssize_t nvme_cmb_sq_depth_store(struct device *dev,
 					const char *buf, size_t count)
 {
 	struct nvme_ctrl *ctrl = dev_get_drvdata(dev);
-	struct nvme_cmb *cmb = ctrl->cmb;
+	int ret;
 	u32 sq_depth;
 
 	sscanf(buf, "%u", &sq_depth);
-	if (sq_depth > 0xffff)
-		return -EINVAL;
+	ret = nvme_cmb_update_sq_depth(ctrl, sq_depth);
+	if (ret)
+		return ret;
 
-	if (sq_depth > 0 && sq_depth < ctrl->tagset->reserved_tags + 1)
-		return -EINVAL;
-
-	cmb->sq_depth = sq_depth;
 	return count;
 }
 static DEVICE_ATTR(cmb_sq_depth, S_IWUSR | S_IRUGO, nvme_cmb_sq_depth_show,
@@ -1079,14 +1076,14 @@ static ssize_t nvme_cmb_sq_offset_store(struct device *dev,
 					const char *buf, size_t count)
 {
 	struct nvme_ctrl *ctrl = dev_get_drvdata(dev);
-	struct nvme_cmb *cmb = ctrl->cmb;
+	int ret;
 	u64 sq_offset;
 
 	sscanf(buf, "%llu", &sq_offset);
-	if (sq_offset >= resource_size(cmb->res))
-		return -EINVAL;
+	ret = nvme_cmb_update_sq_offset(ctrl, sq_offset);
+	if (ret)
+		return ret;
 
-	cmb->sq_offset = sq_offset;
 	return count;
 }
 static DEVICE_ATTR(cmb_sq_offset, S_IWUSR | S_IRUGO, nvme_cmb_sq_offset_show,
@@ -1426,6 +1423,43 @@ void nvme_remove_namespaces(struct nvme_ctrl *ctrl)
 	mutex_unlock(&ctrl->namespaces_mutex);
 }
 EXPORT_SYMBOL_GPL(nvme_remove_namespaces);
+
+int nvme_cmb_update_sq_depth(struct nvme_ctrl *ctrl, u32 sq_depth)
+{
+	struct nvme_cmb *cmb = ctrl->cmb;
+	unsigned int min_depth;
+
+	if (sq_depth > 0xffff)
+		return -EINVAL;
+
+	/*
+	 * No tagset allocated yet due to being called to
+	 * initialize from a module parameter. Assume one
+	 * reserved tag
+	 */
+	if (!ctrl->tagset)
+		min_depth = 2;
+	else
+		min_depth = ctrl->tagset->reserved_tags + 1;
+
+	if (sq_depth > 0 && sq_depth < min_depth)
+		return -EINVAL;
+
+	cmb->sq_depth = sq_depth;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(nvme_cmb_update_sq_depth);
+
+int nvme_cmb_update_sq_offset(struct nvme_ctrl *ctrl, u64 sq_offset)
+{
+	struct nvme_cmb *cmb = ctrl->cmb;
+	if (sq_offset >= resource_size(cmb->res))
+		return -EINVAL;
+
+	cmb->sq_offset = sq_offset;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(nvme_cmb_update_sq_offset);
 
 static int nvme_init_cmb(struct nvme_ctrl *ctrl)
 {

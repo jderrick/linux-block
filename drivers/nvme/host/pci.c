@@ -60,6 +60,14 @@
 static int use_threaded_interrupts;
 module_param(use_threaded_interrupts, int, 0);
 
+static unsigned int cmb_sq_depth = 64;
+module_param(cmb_sq_depth, uint, 0644);
+MODULE_PARM_DESC(cmb_sq_depth, "SQ Depth in Controller Memory Buffer");
+
+static unsigned long cmb_sq_offset;
+module_param(cmb_sq_offset, ulong, 0644);
+MODULE_PARM_DESC(cmb_sq_offset, "SQ Offset in Controller Memory Buffer");
+
 static LIST_HEAD(dev_list);
 static DEFINE_SPINLOCK(dev_list_lock);
 static struct task_struct *nvme_thread;
@@ -1401,9 +1409,10 @@ static int nvme_remap_queue(struct nvme_dev *dev, struct nvme_queue *nvmeq)
 	nvme_release_sq(nvmeq);
 	nvme_release_cq(nvmeq);
 
-	if (!cmb->sq_depth)
-		dev->q_depth = dev->tagset.queue_depth;
-	nvmeq->q_depth = dev->q_depth;
+	if (cmb->sq_depth)
+		nvmeq->q_depth = cmb->sq_depth;
+	else
+		nvmeq->q_depth = dev->tagset.queue_depth;
 
 	nvmeq->cqes = dma_zalloc_coherent(dev->dev, CQ_SIZE(nvmeq->q_depth),
 					  &nvmeq->cq_dma_addr, GFP_KERNEL);
@@ -1560,9 +1569,7 @@ static int nvme_setup_io_queues(struct nvme_dev *dev)
 
 	if (cmb->flags & NVME_CMB_SQ_SUPPORTED && cmb->sq_depth) {
 		result = nvme_cmb_sq_depth(dev, nr_io_queues);
-		if (result > 0)
-			dev->q_depth = result;
-		else {
+		if (result < 0) {
 			dev_warn(dev->dev, "Could not allocate %d-deep queues "
 					"in CMB\n", cmb->sq_depth);
 			cmb->sq_depth = 0;
@@ -1740,6 +1747,7 @@ static void nvme_disable_io_queues(struct nvme_dev *dev)
  */
 static int nvme_dev_add(struct nvme_dev *dev)
 {
+	struct nvme_cmb *cmb = dev->ctrl.cmb;
 	if (!dev->ctrl.tagset) {
 		dev->tagset.ops = &nvme_mq_ops;
 		dev->tagset.nr_hw_queues = dev->online_queues - 1;
@@ -1755,7 +1763,8 @@ static int nvme_dev_add(struct nvme_dev *dev)
 			return 0;
 		dev->ctrl.tagset = &dev->tagset;
 	} else {
-		blk_mq_update_nr_hw_requests(&dev->tagset, dev->q_depth);
+		int depth = cmb->sq_depth ? cmb->sq_depth : dev->q_depth;
+		blk_mq_update_nr_hw_requests(&dev->tagset, depth);
 		blk_mq_update_nr_hw_queues(&dev->tagset, dev->online_queues - 1);
 
 		/* Free previously allocated queues that are no longer usable */
@@ -2160,6 +2169,16 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 			id->driver_data);
 	if (result)
 		goto release_pools;
+
+	if (cmb_sq_depth &&
+	    nvme_cmb_update_sq_depth(&dev->ctrl, cmb_sq_depth))
+		dev_warn(dev->dev, "Invalid CMB sq depth (%u)\n",
+			cmb_sq_depth);
+
+	if (cmb_sq_offset &&
+	    nvme_cmb_update_sq_offset(&dev->ctrl, cmb_sq_offset))
+		dev_warn(dev->dev, "Invalid CMB sq offset (%#lx)\n",
+			cmb_sq_offset);
 
 	dev_info(dev->ctrl.device, "pci function %s\n", dev_name(&pdev->dev));
 
