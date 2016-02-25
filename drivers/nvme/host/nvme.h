@@ -118,9 +118,8 @@ struct nvme_ns {
 };
 
 struct nvme_cmb {
+	struct resource *res;
 	void __iomem *cmb;
-	dma_addr_t dma_addr;
-	u64 size;
 	u64 sq_offset;
 	u16 sq_depth;
 	unsigned long flags;

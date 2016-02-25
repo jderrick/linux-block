@@ -1083,7 +1083,7 @@ static ssize_t nvme_cmb_sq_offset_store(struct device *dev,
 	u64 sq_offset;
 
 	sscanf(buf, "%llu", &sq_offset);
-	if (sq_offset >= cmb->size)
+	if (sq_offset >= resource_size(cmb->res))
 		return -EINVAL;
 
 	cmb->sq_offset = sq_offset;
